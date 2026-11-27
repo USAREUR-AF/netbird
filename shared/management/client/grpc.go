@@ -99,6 +99,17 @@ func MaxRecvMsgSize() int {
 
 // NewClient creates a new client to Management service
 func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
+	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, false)
+}
+
+// NewClientLazy creates a Management client without waiting for the server to answer.
+// The connection is made in the background; Sync and the other streams wait for it.
+// Used when the client starts from a cached network map while management is unreachable.
+func NewClientLazy(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
+	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, true)
+}
+
+func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool, lazy bool) (*GrpcClient, error) {
 	var conn *grpc.ClientConn
 
 	var extraOpts []grpc.DialOption
@@ -109,7 +120,11 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 
 	operation := func() error {
 		var err error
-		conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
+		if lazy {
+			conn, err = nbgrpc.CreateConnectionLazy(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
+		} else {
+			conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
+		}
 		if err != nil {
 			return fmt.Errorf("create connection: %w", err)
 		}

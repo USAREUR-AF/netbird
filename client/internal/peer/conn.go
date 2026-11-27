@@ -104,6 +104,9 @@ type Conn struct {
 	onConnected                               func(remoteWireGuardKey string, remoteRosenpassPubKey []byte, wireGuardIP string, remoteRosenpassAddr string)
 	onDisconnected                            func(remotePeer string)
 	rosenpassInitializedPresharedKeyValidator func(peerKey string) bool
+	// onDirectEndpoint is called with the remote address when WireGuard is
+	// pointed at a direct (not relayed, not proxied) ICE path.
+	onDirectEndpoint func(remoteWireGuardKey string, endpoint *net.UDPAddr)
 
 	statusRelay         *worker.AtomicWorkerStatus
 	statusICE           *worker.AtomicWorkerStatus
@@ -309,6 +312,28 @@ func (conn *Conn) SetOnConnected(handler func(remoteWireGuardKey string, remoteR
 	conn.onConnected = handler
 }
 
+// SetOnDirectEndpoint sets a handler called with the remote address each time WireGuard is
+// configured with a direct ICE path to the remote peer. The engine records it so that a
+// start from a cached network map can reach the peer without signal.
+func (conn *Conn) SetOnDirectEndpoint(handler func(remoteWireGuardKey string, endpoint *net.UDPAddr)) {
+	conn.onDirectEndpoint = handler
+}
+
+// PrimeEndpoint points WireGuard at a remote endpoint recorded before the client restarted,
+// so that WireGuard can complete a handshake while signal is unreachable. It does nothing
+// when ICE or relay has already configured the peer. A later ICE or relay connection
+// replaces the endpoint as usual.
+func (conn *Conn) PrimeEndpoint(endpoint *net.UDPAddr) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if endpoint == nil || conn.currentConnPriority != conntype.None {
+		return nil
+	}
+	conn.Log.Infof("configure WireGuard endpoint from the cached network map: %s", endpoint)
+	return conn.endpointUpdater.SwitchWGEndpoint(endpoint, conn.presharedKey(nil))
+}
+
 // SetOnDisconnected sets a handler function to be triggered by Conn when a connection to a remote disconnected
 func (conn *Conn) SetOnDisconnected(handler func(remotePeer string)) {
 	conn.onDisconnected = handler
@@ -416,6 +441,10 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 		return
 	}
 	wgConfigWorkaround()
+
+	if wgProxy == nil && conn.onDirectEndpoint != nil {
+		conn.onDirectEndpoint(conn.config.Key, ep)
+	}
 
 	if conn.wgProxyRelay != nil {
 		conn.Log.Debugf("redirect packets from relayed conn to WireGuard")

@@ -22,6 +22,7 @@ import (
 
 	"github.com/netbirdio/netbird/client/internal/auth"
 	"github.com/netbirdio/netbird/client/internal/expose"
+	"github.com/netbirdio/netbird/client/internal/mapcache"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	sleephandler "github.com/netbirdio/netbird/client/internal/sleep/handler"
 	"github.com/netbirdio/netbird/client/system"
@@ -961,6 +962,11 @@ func (s *Server) handleActiveProfileLogout(ctx context.Context) (*proto.LogoutRe
 		// todo review to update the status in case any type of error
 		log.Errorf("failed to cleanup connection: %v", err)
 		return nil, err
+	}
+
+	// A peer that logged out must not start again from its last network map.
+	if err := mapcache.Remove(mapcache.PathForState(profilemanager.NewServiceManager("").GetStatePath())); err != nil {
+		log.Warnf("failed to remove the cached network map: %v", err)
 	}
 
 	state := internal.CtxGetState(s.rootCtx)

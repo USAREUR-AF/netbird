@@ -41,6 +41,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/dnsfwd"
 	"github.com/netbirdio/netbird/client/internal/expose"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
+	"github.com/netbirdio/netbird/client/internal/mapcache"
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/netflow"
 	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
@@ -160,6 +161,9 @@ type EngineServices struct {
 	StateManager   *statemanager.Manager
 	UpdateManager  *updater.Manager
 	ClientMetrics  *metrics.ClientMetrics
+	// MapCache, when set, receives every network map applied from management
+	// and the last direct endpoint of each peer. Nil disables the cache.
+	MapCache *mapcache.Store
 }
 
 // Engine is a mechanism responsible for reacting on Signal and Management stream events and managing connections to the remote peers.
@@ -250,6 +254,17 @@ type Engine struct {
 	jobExecutorWG sync.WaitGroup
 
 	exposeManager *expose.Manager
+
+	// mapCache persists applied network maps; nil when disabled.
+	mapCache *mapcache.Store
+	// cachedStart is applied by Start instead of waiting for management.
+	cachedStart *mapcache.Entry
+	// runningFromCache is true from a cached start until the first map from
+	// management is applied. Protected by syncMsgMux.
+	runningFromCache bool
+	// cachedLazyExclude keeps peers taken from the cache out of lazy
+	// connection while runningFromCache. Protected by syncMsgMux.
+	cachedLazyExclude map[string]bool
 }
 
 // Peer is an instance of the Connection Peer
@@ -292,6 +307,7 @@ func NewEngine(
 		jobExecutor:        jobexec.NewExecutor(),
 		clientMetrics:      services.ClientMetrics,
 		updateManager:      services.UpdateManager,
+		mapCache:           services.MapCache,
 	}
 
 	log.Infof("I am: %s", config.WgPrivateKey.PublicKey().String())
@@ -571,6 +587,14 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
 	e.srWatcher.Start(peer.IsForceRelayed())
+
+	if e.cachedStart != nil {
+		if err := e.applyCachedMap(e.cachedStart); err != nil {
+			e.close()
+			return fmt.Errorf("apply cached network map: %w", err)
+		}
+		e.cachedStart = nil
+	}
 
 	e.receiveSignalEvents()
 	e.receiveManagementEvents()
@@ -927,13 +951,88 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		log.Debugf("sync response persisted with serial %d", nm.GetSerial())
 	}
 
+	if e.runningFromCache {
+		// The first map from management replaces the cached one whatever its serial:
+		// a management whose serial was reset must not be ignored.
+		log.Infof("received a network map from management (serial %d), replacing the cached network map", nm.GetSerial())
+		e.networkSerial = 0
+		e.runningFromCache = false
+		e.cachedLazyExclude = nil
+	}
+
 	// only apply new changes and ignore old ones
 	if err := e.updateNetworkMap(nm); err != nil {
 		return err
 	}
 
+	e.mapCache.SetNetbirdConfig(update.GetNetbirdConfig())
+	if err := e.mapCache.SaveMap(nm); err != nil {
+		log.Warnf("failed to write the cached network map: %v", err)
+	}
+
 	e.statusRecorder.PublishEvent(cProto.SystemEvent_INFO, cProto.SystemEvent_SYSTEM, "Network map updated", "", nil)
 
+	return nil
+}
+
+// SetCachedStart makes the next Start apply entry's network map before it
+// connects to management, so the engine runs while management is unreachable.
+func (e *Engine) SetCachedStart(entry *mapcache.Entry) {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	e.cachedStart = entry
+}
+
+// RunningFromCache reports whether the engine is running on a cached network
+// map and has not yet received one from management.
+func (e *Engine) RunningFromCache() bool {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	return e.runningFromCache
+}
+
+// applyCachedMap applies a cached network map and points WireGuard at each
+// peer's last direct endpoint. The caller holds syncMsgMux.
+func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
+	nm, err := entry.Map()
+	if err != nil {
+		return err
+	}
+	age, _ := entry.Age(mapcache.SystemClock)
+	endpoints := entry.DirectEndpoints()
+
+	e.runningFromCache = true
+	e.cachedLazyExclude = make(map[string]bool, len(endpoints))
+	for k := range endpoints {
+		e.cachedLazyExclude[k] = true
+	}
+
+	if err := e.updateNetworkMap(nm); err != nil {
+		return err
+	}
+
+	primed := 0
+	if e.config.RosenpassEnabled {
+		log.Infof("Rosenpass is enabled: peers from the cached network map wait for signal instead of using their last endpoint")
+	} else {
+		for key, ep := range endpoints {
+			conn, ok := e.peerStore.PeerConn(key)
+			if !ok {
+				continue
+			}
+			if err := conn.PrimeEndpoint(ep); err != nil {
+				conn.Log.Warnf("failed to configure the cached endpoint %s: %v", ep, err)
+				continue
+			}
+			primed++
+		}
+	}
+	// A fresh map from management always applies, whatever its serial.
+	e.networkSerial = 0
+
+	msg := fmt.Sprintf("Started from a cached network map received %s ago: %d peers, %d with a last direct endpoint", age.Round(time.Second), len(nm.GetRemotePeers()), primed)
+	log.Info(msg)
+	e.statusRecorder.PublishEvent(cProto.SystemEvent_WARNING, cProto.SystemEvent_SYSTEM, "Running from cached network map", msg, nil)
 	return nil
 }
 
@@ -1373,6 +1472,9 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 
 	// must set the exclude list after the peers are added. Without it the manager can not figure out the peers parameters from the store
 	excludedLazyPeers := e.toExcludedLazyPeers(forwardingRules, remotePeers)
+	for k := range e.cachedLazyExclude {
+		excludedLazyPeers[k] = true
+	}
 	e.connMgr.SetExcludeList(e.ctx, excludedLazyPeers)
 
 	e.networkSerial = serial
@@ -1652,6 +1754,10 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 		return nil, err
 	}
 
+	if e.mapCache != nil {
+		peerConn.SetOnDirectEndpoint(e.mapCache.SetEndpoint)
+	}
+
 	if e.rpManager != nil {
 		peerConn.SetOnConnected(e.rpManager.OnConnected)
 		peerConn.SetOnDisconnected(e.rpManager.OnDisconnected)
@@ -1726,6 +1832,11 @@ func (e *Engine) receiveSignalEvents() {
 		}
 	}()
 
+	if e.runningFromCache {
+		// Started from a cached network map: signal is usually unreachable as well, and
+		// the peers already have their last direct endpoints. Do not wait for it.
+		return
+	}
 	e.signal.WaitStreamConnected()
 }
 
