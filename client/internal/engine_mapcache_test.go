@@ -611,8 +611,11 @@ func TestEngine_NetworkMapFromSync(t *testing.T) {
 	_, _, err = verifying.networkMapFromSync(signedResp(signer, "another-peer"))
 	assert.ErrorIs(t, err, mapsign.ErrWrongPeer, "a map issued to another peer is refused")
 
-	stale := &Engine{config: &EngineConfig{WgPrivateKey: wgKey}, mapTrust: trust, mapMaxAge: time.Nanosecond}
-	_, _, err = stale.networkMapFromSync(signedResp(signer, peerKey))
+	stale := &Engine{config: &EngineConfig{WgPrivateKey: wgKey}, mapTrust: trust, mapMaxAge: time.Millisecond}
+	staleResp := signedResp(signer, peerKey)
+	// Wait past the maximum age by more than the coarsest system clock tick (Windows).
+	time.Sleep(50 * time.Millisecond)
+	_, _, err = stale.networkMapFromSync(staleResp)
 	assert.Error(t, err, "a map signed longer ago than the maximum age is refused")
 
 	got, _, err = verifying.networkMapFromSync(&mgmProto.SyncResponse{NetbirdConfig: &mgmProto.NetbirdConfig{}})
