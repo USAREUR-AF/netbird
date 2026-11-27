@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,9 +26,11 @@ func TestIssueChain(t *testing.T) {
 	}
 	root, next, site := keyEntry("root.pem"), keyEntry("next.pem"), keyEntry("site.pem")
 
-	fi, err := os.Stat(path("root.pem"))
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(path("root.pem"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "a key file is owner-only")
+	}
 
 	writeDoc := func(name string, version uint64, rootKey goatroot.Key) {
 		d := goatroot.Document{Format: 1, GoatnetID: "goatnet-1", Version: version, MapMaxAgeSeconds: 259200,
