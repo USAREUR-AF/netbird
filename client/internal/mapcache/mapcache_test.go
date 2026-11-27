@@ -34,9 +34,9 @@ func (c *fakeClock) advance(d time.Duration) {
 var testBinding = Binding{ManagementURL: "https://management.example:443", PeerKey: "peer-key-a"}
 
 func testMap(serial uint64, peers ...string) *mgmProto.NetworkMap {
-	nm := &mgmProto.NetworkMap{Serial: serial, PeerConfig: &mgmProto.PeerConfig{Address: "100.64.0.1/16", Fqdn: "a.example"}}
+	nm := &mgmProto.NetworkMap{Serial: serial, PeerConfig: &mgmProto.PeerConfig{Address: "198.51.100.1/24", Fqdn: "a.example"}}
 	for i, p := range peers {
-		nm.RemotePeers = append(nm.RemotePeers, &mgmProto.RemotePeerConfig{WgPubKey: p, AllowedIps: []string{"100.64.0." + string(rune('2'+i)) + "/32"}})
+		nm.RemotePeers = append(nm.RemotePeers, &mgmProto.RemotePeerConfig{WgPubKey: p, AllowedIps: []string{"198.51.100." + string(rune('2'+i)) + "/32"}})
 	}
 	return nm
 }
@@ -58,7 +58,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 			Turns:  []*mgmProto.ProtectedHostConfig{{HostConfig: &mgmProto.HostConfig{Uri: "turn:turn.example"}, User: "u", Password: "p"}},
 			Flow:   &mgmProto.FlowConfig{Url: "flow.example", TokenPayload: "fp", TokenSignature: "fs"},
 		},
-		PeerConfig: &mgmProto.PeerConfig{Address: "100.64.0.1/16"},
+		PeerConfig: &mgmProto.PeerConfig{Address: "198.51.100.1/24"},
 	})
 	s.SetEndpoint("peer-b", &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 51820})
 	require.NoError(t, s.SaveMap(testMap(7, "peer-b", "peer-c")))
