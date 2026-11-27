@@ -1031,10 +1031,7 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return err
 	}
 
-	e.mapCache.SetNetbirdConfig(update.GetNetbirdConfig())
-	if err := e.mapCache.SaveMap(nm, signed); err != nil {
-		log.Warnf("failed to write the cached network map: %v", err)
-	}
+	e.persistMap(update, nm, signed)
 
 	e.statusRecorder.PublishEvent(cProto.SystemEvent_INFO, cProto.SystemEvent_SYSTEM, "Network map updated", "", nil)
 
@@ -1065,47 +1062,6 @@ func EffectiveMapMaxAge(doc *goatroot.Document, override time.Duration) time.Dur
 		return override
 	}
 	return maxAge
-}
-
-// applyRootDocument replaces the held root document with the one in update when
-// it is a valid successor, writes it to disk, and takes the map signers and the
-// maximum age from it. The caller holds syncMsgMux.
-func (e *Engine) applyRootDocument(update *mgmProto.SyncResponse) {
-	if e.rootDoc == nil {
-		return
-	}
-	candidate, err := goatroot.FromSyncResponse(update)
-	if err != nil {
-		log.Warnf("ignoring the goatnet root document from management: %v", err)
-		return
-	}
-	if candidate == nil {
-		return
-	}
-	if err := goatroot.Successor(e.rootDoc, candidate); err != nil {
-		if !errors.Is(err, goatroot.ErrNotNewer) {
-			log.Warnf("refusing the goatnet root document version %d from management: %v", candidate.Doc().Version, err)
-		}
-		return
-	}
-	trust, err := candidate.Doc().TrustSet()
-	if err != nil {
-		log.Warnf("refusing the goatnet root document version %d: %v", candidate.Doc().Version, err)
-		return
-	}
-	if e.rootDocPath != "" {
-		if err := goatroot.Store(e.rootDocPath, candidate); err != nil {
-			log.Errorf("failed to write the goatnet root document version %d: %v", candidate.Doc().Version, err)
-			return
-		}
-	}
-	msg := fmt.Sprintf("goatnet root document version %d replaces version %d: %d map signers, maximum map age %s",
-		candidate.Doc().Version, e.rootDoc.Doc().Version, len(candidate.Doc().MapSigners), candidate.Doc().MapMaxAge())
-	log.Info(msg)
-	e.rootDoc = candidate
-	e.mapTrust = trust
-	e.mapMaxAge = EffectiveMapMaxAge(candidate.Doc(), e.mapMaxAgeOverride)
-	e.statusRecorder.PublishEvent(cProto.SystemEvent_INFO, cProto.SystemEvent_SYSTEM, "Goatnet root document updated", msg, nil)
 }
 
 // networkMapFromSync returns the network map of a sync response and the signed
@@ -1939,8 +1895,8 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 		return nil, err
 	}
 
-	if e.mapCache != nil {
-		peerConn.SetOnDirectEndpoint(e.mapCache.SetEndpoint)
+	if hook := e.directEndpointHook(); hook != nil {
+		peerConn.SetOnDirectEndpoint(hook)
 	}
 
 	if e.rpManager != nil {
