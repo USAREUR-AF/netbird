@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	gproto "google.golang.org/protobuf/proto"
 
 	"github.com/netbirdio/netbird/shared/management/client/common"
 
@@ -45,6 +46,7 @@ import (
 	"github.com/netbirdio/netbird/management/server/settings"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	"github.com/netbirdio/netbird/shared/management/proto"
 	internalStatus "github.com/netbirdio/netbird/shared/management/status"
@@ -90,6 +92,8 @@ type Server struct {
 
 	// mapSigner signs every network map sent to a peer; nil when map signing is not configured.
 	mapSigner *mapsign.Signer
+	// rootDocument is the goatnet root document sent with every sync response; nil when not configured.
+	rootDocument *rootDocumentFile
 }
 
 // NewServer creates a new Management server
@@ -143,9 +147,17 @@ func NewServer(
 		}
 		log.Infof("signing network maps for goatnet %s with key %s, refresh every %s", ms.GoatnetID, mapSigner.KeyID(), mapSigner.RefreshInterval())
 	}
+	var rootDocument *rootDocumentFile
+	if ms := config.GoatMapSigning; ms != nil && ms.RootDocumentFile != "" {
+		rootDocument = &rootDocumentFile{path: ms.RootDocumentFile}
+		if _, err := rootDocument.get(); err != nil {
+			return nil, fmt.Errorf("goatnet root document: %w", err)
+		}
+	}
 
 	return &Server{
 		mapSigner:                mapSigner,
+		rootDocument:             rootDocument,
 		jobManager:               jobManager,
 		accountManager:           accountManager,
 		settingsManager:          settingsManager,
@@ -508,7 +520,7 @@ func (s *Server) sendUpdate(ctx context.Context, accountID string, peerKey wgtyp
 		return status.Errorf(codes.Internal, "failed processing update message")
 	}
 
-	resp, err := s.mapSigner.SignSyncResponse(peerKey.String(), update.Update)
+	resp, err := s.goatSyncResponse(peerKey, update.Update)
 	if err != nil {
 		log.WithContext(ctx).Errorf("failed to sign the network map for peer %s: %v", peerKey.String(), err)
 		s.cancelPeerRoutines(ctx, accountID, peer, streamStartTime)
@@ -530,6 +542,30 @@ func (s *Server) sendUpdate(ctx context.Context, accountID string, peerKey wgtyp
 	}
 	log.WithContext(ctx).Debugf("sent an update to peer %s", peerKey.String())
 	return nil
+}
+
+// goatSyncResponse returns resp with its network map signed and the goatnet root
+// document attached, as configured. resp itself is not changed.
+func (s *Server) goatSyncResponse(peerKey wgtypes.Key, resp *proto.SyncResponse) (*proto.SyncResponse, error) {
+	out, err := s.mapSigner.SignSyncResponse(peerKey.String(), resp)
+	if err != nil {
+		return nil, err
+	}
+	if s.rootDocument == nil {
+		return out, nil
+	}
+	doc, err := s.rootDocument.get()
+	if err != nil {
+		log.Warnf("not sending the goatnet root document: %v", err)
+		return out, nil
+	}
+	if out == resp {
+		out = gproto.Clone(resp).(*proto.SyncResponse)
+	}
+	if err := goatroot.Attach(out, doc); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // sendJob encrypts the update message using the peer key and the server's wireguard key,
@@ -975,7 +1011,7 @@ func (s *Server) sendInitialSync(ctx context.Context, peerKey wgtypes.Key, peer 
 		return status.Errorf(codes.Internal, "failed getting server key")
 	}
 
-	signedResp, err := s.mapSigner.SignSyncResponse(peerKey.String(), plainResp)
+	signedResp, err := s.goatSyncResponse(peerKey, plainResp)
 	if err != nil {
 		log.WithContext(ctx).Errorf("failed to sign the network map for peer %s: %v", peerKey.String(), err)
 		return status.Errorf(codes.Internal, "error handling request")
