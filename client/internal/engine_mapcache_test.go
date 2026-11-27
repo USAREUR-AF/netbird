@@ -300,14 +300,14 @@ func TestEngine_StartFromCachedMap(t *testing.T) {
 
 	// 4. WireGuard completes a handshake on the cached direct endpoint, in both directions.
 	waitFor(t, 60*time.Second, "a WireGuard handshake between A and B after the restart", func() bool {
-		epA, hsA, okA := a.wgPeer(b.key)
-		_, hsB, okB := b.wgPeer(a.key)
-		return okA && okB && epA == cachedEndpoint && hsA.After(restartedAt) && hsB.After(restartedAt)
+		endpointAB, handshakeAB, foundAB := a.wgPeer(b.key)
+		_, handshakeBA, foundBA := b.wgPeer(a.key)
+		return foundAB && foundBA && endpointAB == cachedEndpoint && handshakeAB.After(restartedAt) && handshakeBA.After(restartedAt)
 	})
-	epA, hsA, _ := a.wgPeer(b.key)
-	_, hsB, _ := b.wgPeer(a.key)
+	endpointAB, handshakeAB, _ := a.wgPeer(b.key)
+	_, handshakeBA, _ := b.wgPeer(a.key)
 	t.Logf("after restart: A->B endpoint %s handshake +%s; B->A handshake +%s; 1 of 1 peers reached directly",
-		epA, hsA.Sub(restartedAt).Round(time.Millisecond), hsB.Sub(restartedAt).Round(time.Millisecond))
+		endpointAB, handshakeAB.Sub(restartedAt).Round(time.Millisecond), handshakeBA.Sub(restartedAt).Round(time.Millisecond))
 	assert.False(t, managementReachable(a.engine), "management was unreachable throughout")
 
 	before, err := mapcache.Load(a.cachePath)
