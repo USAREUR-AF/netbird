@@ -24,6 +24,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
@@ -44,6 +45,10 @@ const (
 	// and nothing is read.
 	EnvDisable = "NB_MAP_CACHE_DISABLE"
 
+	// EnvTrustFile names a map trust file (see mapsign.LoadTrustFile). When set,
+	// every network map, fresh or cached, must be signed by a signer it lists.
+	EnvTrustFile = "NB_MAP_TRUST_FILE"
+
 	fileSuffix = ".goat-map.json"
 )
 
@@ -56,6 +61,8 @@ var (
 	ErrTooOld = errors.New("cached network map is older than the maximum age")
 	// ErrClockBehind means the system clock reads earlier than the receive time.
 	ErrClockBehind = errors.New("system clock reads earlier than the cached network map's receive time")
+	// ErrUnverified means the cached map does not verify against the trust set.
+	ErrUnverified = errors.New("cached network map does not verify")
 	// ErrFormat means the file could not be parsed or has another format version.
 	ErrFormat = errors.New("cached network map has an unknown format")
 )
@@ -76,8 +83,12 @@ type Entry struct {
 	// removed. It carries the peer config, the signal and relay URLs, and
 	// the posture checks.
 	Login []byte `json:"login"`
-	// NetworkMap is the last applied NetworkMap in protobuf wire form.
-	NetworkMap []byte `json:"network_map"`
+	// NetworkMap is the last applied NetworkMap in protobuf wire form. Empty
+	// when the map arrived signed: it is then read from SignedMap.
+	NetworkMap []byte `json:"network_map,omitempty"`
+	// SignedMap is the signed map the network map arrived in (mapsign.SignedMap),
+	// kept as received so its signature can be checked again at load.
+	SignedMap []byte `json:"signed_map,omitempty"`
 	// Endpoints maps a remote peer's WireGuard key to the last direct
 	// (not relayed, not proxied) WireGuard endpoint seen for it.
 	Endpoints map[string]string `json:"endpoints,omitempty"`
@@ -98,8 +109,48 @@ func (e *Entry) LoginResponse() (*mgmProto.LoginResponse, error) {
 	return resp, nil
 }
 
+// Signed decodes the signed map the cached map arrived in, or returns nil when it arrived unsigned.
+func (e *Entry) Signed() (*mapsign.SignedMap, error) {
+	if len(e.SignedMap) == 0 {
+		return nil, nil //nolint:nilnil // the map arrived unsigned
+	}
+	return mapsign.UnmarshalSignedMap(e.SignedMap)
+}
+
+// VerifySigned checks the cached map against a trust set: it must have arrived
+// signed by a trusted signer, for this goatnet and peer, and its signed issue
+// time must be within maxAge of the system clock.
+func (e *Entry) VerifySigned(ts *mapsign.TrustSet, maxAge time.Duration, c Clock) error {
+	signed, err := e.Signed()
+	if err != nil {
+		return err
+	}
+	if signed == nil {
+		return fmt.Errorf("%w: %w", ErrUnverified, mapsign.ErrUnsigned)
+	}
+	env, err := ts.Verify(e.PeerKey, signed)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnverified, err)
+	}
+	if issuedAge := c.Wall().Sub(env.IssuedAt()); issuedAge > maxAge {
+		return fmt.Errorf("%w: signed %s ago, maximum %s", ErrTooOld, issuedAge.Round(time.Second), maxAge)
+	}
+	return nil
+}
+
 // Map decodes the cached network map.
 func (e *Entry) Map() (*mgmProto.NetworkMap, error) {
+	if len(e.SignedMap) > 0 {
+		signed, err := e.Signed()
+		if err != nil {
+			return nil, err
+		}
+		env, err := mapsign.Open(signed)
+		if err != nil {
+			return nil, err
+		}
+		return env.Map(), nil
+	}
 	nm := &mgmProto.NetworkMap{}
 	if err := proto.Unmarshal(e.NetworkMap, nm); err != nil {
 		return nil, fmt.Errorf("decode cached network map: %w", err)
@@ -192,6 +243,15 @@ func ParseMaxAge(v string) (time.Duration, error) {
 	return d, nil
 }
 
+// TrustFromEnv loads the declared map trust file. It returns nil, nil when none is declared.
+func TrustFromEnv() (*mapsign.TrustSet, error) {
+	path := strings.TrimSpace(os.Getenv(EnvTrustFile))
+	if path == "" {
+		return nil, nil //nolint:nilnil // no trust file declared: unsigned maps are accepted
+	}
+	return mapsign.LoadTrustFile(path)
+}
+
 // Disabled reports whether the cache is turned off.
 func Disabled() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv(EnvDisable)), "true")
@@ -224,9 +284,10 @@ func Load(path string) (*Entry, error) {
 	return e, nil
 }
 
-// LoadUsable loads the cache at path and checks it. It deletes a cache that
-// fails the binding or age check, so a refused cache is never tried again.
-func LoadUsable(path string, b Binding, maxAge time.Duration, c Clock) (*Entry, error) {
+// LoadUsable loads the cache at path and checks it. With a trust set the map
+// must also verify (VerifySigned). It deletes a cache that fails the binding,
+// age or signature check, so a refused cache is never tried again.
+func LoadUsable(path string, b Binding, maxAge time.Duration, c Clock, ts *mapsign.TrustSet) (*Entry, error) {
 	e, err := Load(path)
 	if err != nil {
 		if errors.Is(err, ErrFormat) {
@@ -239,6 +300,12 @@ func LoadUsable(path string, b Binding, maxAge time.Duration, c Clock) (*Entry, 
 			_ = Remove(path)
 		}
 		return nil, err
+	}
+	if ts != nil {
+		if err := e.VerifySigned(ts, maxAge, c); err != nil {
+			_ = Remove(path)
+			return nil, err
+		}
 	}
 	return e, nil
 }
@@ -364,8 +431,9 @@ func (s *Store) SetNetbirdConfig(cfg *mgmProto.NetbirdConfig) {
 	})
 }
 
-// SaveMap writes the cache with nm as the network map, received now.
-func (s *Store) SaveMap(nm *mgmProto.NetworkMap) error {
+// SaveMap writes the cache with nm as the network map, received now. signed is
+// the signed map nm was read from, or nil when it arrived unsigned.
+func (s *Store) SaveMap(nm *mgmProto.NetworkMap, signed *mapsign.SignedMap) error {
 	if s == nil || nm == nil {
 		return nil
 	}
@@ -384,9 +452,17 @@ func (s *Store) SaveMap(nm *mgmProto.NetworkMap) error {
 	if err != nil {
 		return fmt.Errorf("encode login: %w", err)
 	}
-	mapBytes, err := proto.Marshal(nm)
-	if err != nil {
-		return fmt.Errorf("encode network map: %w", err)
+	var mapBytes, signedBytes []byte
+	if signed != nil {
+		signedBytes, err = signed.Marshal()
+		if err != nil {
+			return fmt.Errorf("encode signed network map: %w", err)
+		}
+	} else {
+		mapBytes, err = proto.Marshal(nm)
+		if err != nil {
+			return fmt.Errorf("encode network map: %w", err)
+		}
 	}
 
 	// Keep endpoints only for peers still in the map.
@@ -404,6 +480,7 @@ func (s *Store) SaveMap(nm *mgmProto.NetworkMap) error {
 		PeerKey:       s.binding.PeerKey,
 		Login:         loginBytes,
 		NetworkMap:    mapBytes,
+		SignedMap:     signedBytes,
 		Endpoints:     copyMap(keep),
 		ReceivedWall:  s.clock.Wall(),
 	}

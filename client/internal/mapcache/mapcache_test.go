@@ -1,6 +1,9 @@
 package mapcache
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -11,7 +14,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
@@ -61,7 +66,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		PeerConfig: &mgmProto.PeerConfig{Address: "198.51.100.1/24"},
 	})
 	s.SetEndpoint("peer-b", &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 51820})
-	require.NoError(t, s.SaveMap(testMap(7, "peer-b", "peer-c")))
+	require.NoError(t, s.SaveMap(testMap(7, "peer-b", "peer-c"), nil))
 
 	if runtime.GOOS != "windows" {
 		fi, err := os.Stat(path)
@@ -97,7 +102,7 @@ func TestEndpointRecordedAfterSaveRewritesCache(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
 	s := NewStore(path, testBinding, clock)
-	require.NoError(t, s.SaveMap(testMap(1, "peer-b")))
+	require.NoError(t, s.SaveMap(testMap(1, "peer-b"), nil))
 
 	clock.advance(time.Minute)
 	s.SetEndpoint("peer-b", &net.UDPAddr{IP: net.ParseIP("192.0.2.20"), Port: 51820})
@@ -116,7 +121,7 @@ func TestEndpointsDroppedForPeersNoLongerInMap(t *testing.T) {
 	s := NewStore(path, testBinding, newClock())
 	s.SetEndpoint("peer-b", &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 51820})
 	s.SetEndpoint("peer-c", &net.UDPAddr{IP: net.ParseIP("192.0.2.11"), Port: 51820})
-	require.NoError(t, s.SaveMap(testMap(2, "peer-c")))
+	require.NoError(t, s.SaveMap(testMap(2, "peer-c"), nil))
 
 	e, err := Load(path)
 	require.NoError(t, err)
@@ -127,7 +132,7 @@ func TestEndpointsDroppedForPeersNoLongerInMap(t *testing.T) {
 func TestCheckRefusesOtherBinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
-	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1)))
+	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1), nil))
 
 	cases := map[string]Binding{
 		"other management URL": {ManagementURL: "https://other.example:443", PeerKey: testBinding.PeerKey},
@@ -141,7 +146,7 @@ func TestCheckRefusesOtherBinding(t *testing.T) {
 		})
 	}
 
-	_, err := LoadUsable(path, cases["other peer key"], DefaultMaxAge, clock)
+	_, err := LoadUsable(path, cases["other peer key"], DefaultMaxAge, clock, nil)
 	assert.ErrorIs(t, err, ErrBinding)
 	_, err = os.Stat(path)
 	assert.True(t, errors.Is(err, os.ErrNotExist), "a cache refused for its binding is deleted")
@@ -150,7 +155,7 @@ func TestCheckRefusesOtherBinding(t *testing.T) {
 func TestAgeOnBootClockIgnoresWallClockSteps(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
-	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1)))
+	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1), nil))
 	e, err := Load(path)
 	require.NoError(t, err)
 
@@ -169,7 +174,7 @@ func TestAgeOnBootClockIgnoresWallClockSteps(t *testing.T) {
 func TestAgeAcrossRebootUsesSystemClockAndRefusesNegative(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
-	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1)))
+	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1), nil))
 	e, err := Load(path)
 	require.NoError(t, err)
 
@@ -188,7 +193,7 @@ func TestAgeAcrossRebootUsesSystemClockAndRefusesNegative(t *testing.T) {
 	assert.ErrorIs(t, e.Check(testBinding, DefaultMaxAge, clock), ErrClockBehind)
 
 	// A clock that is behind does not delete the cache: it may be corrected.
-	_, err = LoadUsable(path, testBinding, DefaultMaxAge, clock)
+	_, err = LoadUsable(path, testBinding, DefaultMaxAge, clock, nil)
 	assert.ErrorIs(t, err, ErrClockBehind)
 	_, err = os.Stat(path)
 	assert.NoError(t, err)
@@ -198,7 +203,7 @@ func TestNoBootClockUsesSystemClock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
 	clock.hasBoot = false
-	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1)))
+	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1), nil))
 	e, err := Load(path)
 	require.NoError(t, err)
 	assert.Empty(t, e.BootID)
@@ -211,14 +216,14 @@ func TestNoBootClockUsesSystemClock(t *testing.T) {
 func TestMapOlderThanBoundIsRefusedAndDeleted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
-	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1)))
+	require.NoError(t, NewStore(path, testBinding, clock).SaveMap(testMap(1), nil))
 
 	clock.advance(DefaultMaxAge - time.Second)
-	_, err := LoadUsable(path, testBinding, DefaultMaxAge, clock)
+	_, err := LoadUsable(path, testBinding, DefaultMaxAge, clock, nil)
 	require.NoError(t, err, "inside the bound")
 
 	clock.advance(2 * time.Second)
-	_, err = LoadUsable(path, testBinding, DefaultMaxAge, clock)
+	_, err = LoadUsable(path, testBinding, DefaultMaxAge, clock, nil)
 	assert.ErrorIs(t, err, ErrTooOld)
 	_, err = os.Stat(path)
 	assert.True(t, errors.Is(err, os.ErrNotExist), "a cache refused for age is deleted")
@@ -228,11 +233,11 @@ func TestFreshMapReplacesCachedOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.goat-map.json")
 	clock := newClock()
 	s := NewStore(path, testBinding, clock)
-	require.NoError(t, s.SaveMap(testMap(9, "peer-b")))
+	require.NoError(t, s.SaveMap(testMap(9, "peer-b"), nil))
 
 	clock.advance(48 * time.Hour)
 	// A fresh map, even with a lower serial (a management whose serial was reset), replaces it.
-	require.NoError(t, s.SaveMap(testMap(3, "peer-c")))
+	require.NoError(t, s.SaveMap(testMap(3, "peer-c"), nil))
 
 	e, err := Load(path)
 	require.NoError(t, err)
@@ -251,7 +256,7 @@ func TestLoadMissingAndCorrupt(t *testing.T) {
 
 	bad := filepath.Join(dir, "bad.goat-map.json")
 	require.NoError(t, os.WriteFile(bad, []byte("{not json"), 0o600))
-	_, err = LoadUsable(bad, testBinding, DefaultMaxAge, newClock())
+	_, err = LoadUsable(bad, testBinding, DefaultMaxAge, newClock(), nil)
 	assert.ErrorIs(t, err, ErrFormat)
 	_, err = os.Stat(bad)
 	assert.True(t, errors.Is(err, os.ErrNotExist), "an unreadable cache is deleted")
@@ -289,7 +294,7 @@ func TestNilStoreIsSafe(t *testing.T) {
 	s.SetNetbirdConfig(&mgmProto.NetbirdConfig{})
 	s.SetEndpoint("k", &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1})
 	s.Seed(&Entry{})
-	assert.NoError(t, s.SaveMap(testMap(1)))
+	assert.NoError(t, s.SaveMap(testMap(1), nil))
 	assert.NoError(t, s.Remove())
 	assert.Equal(t, "", s.Path())
 }
@@ -303,4 +308,102 @@ func TestSystemBootClock(t *testing.T) {
 	require.True(t, ok)
 	assert.NotEmpty(t, id)
 	assert.Positive(t, reading)
+}
+
+func signedTestMap(t *testing.T, signer *mapsign.Signer, peerKey string, nm *mgmProto.NetworkMap) *mapsign.SignedMap {
+	t.Helper()
+	signed, err := signer.Sign(peerKey, nm)
+	require.NoError(t, err)
+	return signed
+}
+
+func TestSignedCacheVerifiesAtLoad(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := mapsign.NewSigner("goatnet-1", key, time.Hour)
+	require.NoError(t, err)
+	trust, err := mapsign.NewTrustSet("goatnet-1", key.Public().(ed25519.PublicKey))
+	require.NoError(t, err)
+
+	t.Run("a signed map verifies and is read from its envelope", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		nm := testMap(5, "peer-b")
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(nm, signedTestMap(t, signer, testBinding.PeerKey, nm)))
+		e, err := LoadUsable(path, testBinding, DefaultMaxAge, SystemClock, trust)
+		require.NoError(t, err)
+		assert.Empty(t, e.NetworkMap, "the map is kept once, inside the signed envelope")
+		got, err := e.Map()
+		require.NoError(t, err)
+		assert.Equal(t, uint64(5), got.GetSerial())
+	})
+
+	t.Run("an unsigned map is refused and deleted", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(testMap(5), nil))
+		_, err := LoadUsable(path, testBinding, DefaultMaxAge, SystemClock, trust)
+		assert.ErrorIs(t, err, ErrUnverified)
+		assert.ErrorIs(t, err, mapsign.ErrUnsigned)
+		_, statErr := os.Stat(path)
+		assert.True(t, errors.Is(statErr, os.ErrNotExist))
+	})
+
+	t.Run("a map signed by an untrusted key is refused", func(t *testing.T) {
+		_, other, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		otherSigner, err := mapsign.NewSigner("goatnet-1", other, time.Hour)
+		require.NoError(t, err)
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		nm := testMap(5)
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(nm, signedTestMap(t, otherSigner, testBinding.PeerKey, nm)))
+		_, err = LoadUsable(path, testBinding, DefaultMaxAge, SystemClock, trust)
+		assert.ErrorIs(t, err, mapsign.ErrUnknownKey)
+	})
+
+	t.Run("a map edited on disk is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		nm := testMap(5, "peer-b")
+		signed := signedTestMap(t, signer, testBinding.PeerKey, nm)
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(nm, signed))
+
+		e, err := Load(path)
+		require.NoError(t, err)
+		env, err := mapsign.Open(signed)
+		require.NoError(t, err)
+		edited := env.Map()
+		edited.RemotePeers = append(edited.RemotePeers, &mgmProto.RemotePeerConfig{WgPubKey: "intruder", AllowedIps: []string{"198.51.100.66/32"}})
+		env.NetworkMap, err = proto.Marshal(edited)
+		require.NoError(t, err)
+		signed.Envelope, err = json.Marshal(env)
+		require.NoError(t, err)
+		e.SignedMap, err = signed.Marshal()
+		require.NoError(t, err)
+		require.NoError(t, write(path, e))
+
+		_, err = LoadUsable(path, testBinding, DefaultMaxAge, SystemClock, trust)
+		assert.ErrorIs(t, err, mapsign.ErrBadSignature)
+	})
+
+	t.Run("a map for another peer is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		nm := testMap(5)
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(nm, signedTestMap(t, signer, "peer-key-z", nm)))
+		_, err := LoadUsable(path, testBinding, DefaultMaxAge, SystemClock, trust)
+		assert.ErrorIs(t, err, mapsign.ErrWrongPeer)
+	})
+
+	t.Run("a map signed longer ago than the bound is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.goat-map.json")
+		nm := testMap(5)
+		signed := signedTestMap(t, signer, testBinding.PeerKey, nm)
+		require.NoError(t, NewStore(path, testBinding, SystemClock).SaveMap(nm, signed))
+		later := &fakeClock{wall: time.Now().Add(2 * time.Hour)}
+		// Received just now by its own record, but signed two hours before the clock reads.
+		e, err := Load(path)
+		require.NoError(t, err)
+		e.ReceivedWall = later.wall
+		e.BootID = ""
+		require.NoError(t, write(path, e))
+		_, err = LoadUsable(path, testBinding, time.Hour, later, trust)
+		assert.ErrorIs(t, err, ErrTooOld)
+	})
 }
