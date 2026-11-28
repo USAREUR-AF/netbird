@@ -124,8 +124,12 @@ func netnsTopology(t *testing.T, n int) {
 	for i := 0; i < n; i++ {
 		ns, host, inner := fmt.Sprintf("mcns%d", i), fmt.Sprintf("mcv%d", i), fmt.Sprintf("mcp%d", i)
 		_ = exec.Command("ip", "netns", "del", ns).Run()
+		_ = exec.Command("ip", "link", "del", host).Run()
 		run(t, "ip", "netns", "add", ns)
-		t.Cleanup(func() { _ = exec.Command("ip", "netns", "del", ns).Run() })
+		t.Cleanup(func() {
+			_ = exec.Command("ip", "link", "del", host).Run()
+			_ = exec.Command("ip", "netns", "del", ns).Run()
+		})
 		run(t, "ip", "link", "add", host, "type", "veth", "peer", "name", inner)
 		run(t, "ip", "link", "set", inner, "netns", ns)
 		run(t, "ip", "link", "set", host, "master", netnsBridge)
