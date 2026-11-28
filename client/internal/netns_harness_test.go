@@ -442,9 +442,10 @@ func TestNetns_RestartFromCachedMap(t *testing.T) {
 
 // Settings for a peer process that verifies maps and keeps revocations.
 const (
-	extraTrustFile = "trust_file"
-	extraRevStore  = "revocation_store"
-	statusRevs     = "revocations"
+	extraTrustFile    = "trust_file"
+	extraRevStore     = "revocation_store"
+	statusRevs        = "revocations"
+	statusRevListings = "revoked_listings"
 )
 
 func init() {
@@ -465,6 +466,7 @@ func init() {
 	helperStatusHooks = append(helperStatusHooks, func(e *Engine, extra map[string]any) {
 		if e.revStore != nil {
 			extra[statusRevs] = len(e.revStore.All())
+			extra[statusRevListings] = e.RevokedListings()
 		}
 	})
 }
@@ -520,13 +522,13 @@ func TestNetns_RevocationFloods(t *testing.T) {
 	})
 	waitFor(t, 30*time.Second, "overlay pings B to A and B to C", func() bool { return b.ping(a.overlayIP()) && b.ping(c.overlayIP()) })
 
-	// B loses management. Then management's list gains a revocation of C,
-	// with a threshold an hour ahead so management's next maps, which still
-	// list C, do not reinstate it during the test.
+	// B loses management. Then management's list gains a revocation of C.
+	// Management keeps listing C in its maps: revocations are absorbing, so
+	// A must keep C out of every later map and count each listing it refuses.
 	gates[1].down()
 	signer, err := readSigningKey(keyPath)
 	require.NoError(t, err)
-	rev, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: "goatnet-test", PeerKey: c.key.PublicKey().String(), ThresholdUnixNano: time.Now().Add(time.Hour).UnixNano(), IssuedAtUnixNano: time.Now().UnixNano()}, signer)
+	rev, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: "goatnet-test", PeerKey: c.key.PublicKey().String(), IssuedAtUnixNano: time.Now().UnixNano()}, signer)
 	require.NoError(t, err)
 	revBytes, err := rev.Marshal()
 	require.NoError(t, err)
@@ -544,6 +546,18 @@ func TestNetns_RevocationFloods(t *testing.T) {
 	t.Logf("revocation of C reached B, which has no path to management, %s after it was issued", time.Since(revokedAt).Round(time.Millisecond))
 	require.False(t, b.ping(c.overlayIP()), "B no longer reaches C")
 	require.True(t, b.ping(a.overlayIP()), "B still reaches A")
+
+	// Management's later maps (refreshed every 2 s) still list C; A keeps it out.
+	listings := func(p *netnsPeer) int {
+		v, _ := p.status().Extra[statusRevListings].(float64)
+		return int(v)
+	}
+	before := listings(a)
+	time.Sleep(5 * time.Second)
+	_, aHasC := a.wg(c)
+	require.False(t, aHasC, "later maps listing C still leave C out")
+	require.Greater(t, listings(a), before, "A counted the maps that listed revoked peer C")
+	t.Logf("A refused %d listings of revoked peer C in management's later maps", listings(a))
 
 	// B restarts from its cached map with management unreachable: the stored revocation still applies.
 	b.stop(t)

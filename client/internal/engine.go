@@ -305,9 +305,8 @@ type Engine struct {
 	revStore *goatrevoke.Store
 	revConn  net.PacketConn
 	revPort  int
-	// currentMapSignedAt is the signing time of the map being applied, zero
-	// for an unsigned map. Protected by syncMsgMux.
-	currentMapSignedAt time.Time
+	// revokedListings counts network maps that listed a revoked peer. Protected by syncMsgMux.
+	revokedListings uint64
 }
 
 // Peer is an instance of the Connection Peer
@@ -967,14 +966,6 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 	if nm != nil && nm.PeerConfig != nil {
 		e.handleAutoUpdateVersion(nm.PeerConfig.AutoUpdate)
 	}
-	if nm != nil {
-		e.currentMapSignedAt = time.Time{}
-		if signed != nil {
-			if env, err := mapsign.Open(signed); err == nil {
-				e.currentMapSignedAt = env.IssuedAt()
-			}
-		}
-	}
 	e.acceptRevocations(update)
 
 	if update.GetNetbirdConfig() != nil {
@@ -1166,12 +1157,6 @@ func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
 	}
 	age, _ := entry.Age(mapcache.SystemClock)
 	endpoints := entry.DirectEndpoints()
-	e.currentMapSignedAt = time.Time{}
-	if signed, err := entry.Signed(); err == nil && signed != nil {
-		if env, err := mapsign.Open(signed); err == nil {
-			e.currentMapSignedAt = env.IssuedAt()
-		}
-	}
 	e.lastVerifiedMap = time.Now().Add(-age)
 
 	e.runningFromCache = true

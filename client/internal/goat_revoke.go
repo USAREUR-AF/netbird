@@ -45,7 +45,6 @@ func (e *Engine) startRevocations() error {
 	if e.revStore == nil || e.mapTrust == nil {
 		return nil
 	}
-	e.revStore.Expire(time.Now(), e.mapMaxAge)
 	port := e.revPort
 	if port == 0 {
 		port = DefaultRevocationPort
@@ -142,15 +141,13 @@ func (e *Engine) acceptRevocation(r *goatrevoke.Signed, from netip.Addr) {
 		source = "peer " + from.String()
 	}
 	revoked := r.Rev().PeerKey
-	if goatrevoke.Revoked([]*goatrevoke.Signed{r}, revoked, e.currentMapSignedAt) {
-		if _, ok := e.peerStore.PeerConn(revoked); ok {
-			if err := e.removePeer(revoked); err != nil {
-				log.Warnf("failed to remove revoked peer %s: %v", revoked, err)
-			}
-			e.statusRecorder.FinishPeerListModifications()
+	if _, ok := e.peerStore.PeerConn(revoked); ok {
+		if err := e.removePeer(revoked); err != nil {
+			log.Warnf("failed to remove revoked peer %s: %v", revoked, err)
 		}
+		e.statusRecorder.FinishPeerListModifications()
 	}
-	msg := fmt.Sprintf("revocation %s of peer %s (threshold %s) from %s", r.ID(), revoked, r.Rev().Threshold().UTC().Format(time.RFC3339), source)
+	msg := fmt.Sprintf("revocation %s of peer %s (signed %s) from %s; the key stays revoked", r.ID(), revoked, r.Rev().IssuedAt().UTC().Format(time.RFC3339), source)
 	log.Info(msg)
 	e.statusRecorder.PublishEvent(cProto.SystemEvent_WARNING, cProto.SystemEvent_SYSTEM, "Peer revoked", msg, nil)
 	e.forwardRevocation(r, from)
@@ -204,10 +201,24 @@ func newRevocationStore(cachePath string) *goatrevoke.Store {
 	return store
 }
 
-// revokedNow reports whether peerKey is revoked for the map being applied.
+// revokedNow reports whether peerKey is revoked. A map that still lists a
+// revoked key is refused for that peer, and the refusal is counted.
 func (e *Engine) revokedNow(peerKey string) bool {
 	if e.revStore == nil || e.mapTrust == nil {
 		return false
 	}
-	return goatrevoke.Revoked(e.revStore.All(), peerKey, e.currentMapSignedAt)
+	if !goatrevoke.Revoked(e.revStore.All(), peerKey) {
+		return false
+	}
+	e.revokedListings++
+	log.Warnf("the network map lists revoked peer %s; leaving it out (%d such listings refused)", peerKey, e.revokedListings)
+	return true
+}
+
+// RevokedListings is how many times a network map listed a revoked peer and
+// the peer was left out.
+func (e *Engine) RevokedListings() uint64 {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	return e.revokedListings
 }

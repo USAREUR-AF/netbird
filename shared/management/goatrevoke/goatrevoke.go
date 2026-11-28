@@ -1,10 +1,11 @@
 // Package goatrevoke is a signed revocation of one peer in a goatnet
 // (USAREUR-AF/goatcore ADR 1273, phase 4).
 //
-// A revocation names a peer's WireGuard key and a threshold time. It means:
-// refuse this peer in every network map signed at or before the threshold.
-// A map signed after the threshold that lists the peer again reinstates it,
-// since management has decided again. A revocation is signed by a map signer
+// A revocation names a peer's WireGuard key. It is absorbing, as revocations
+// are on goat's replicated mesh and identity tables (ADR 1193): the key stays
+// revoked for good, and a later network map that still lists it is refused for
+// that peer. A device that comes back does so with a new key and a new
+// enrollment. A revocation is signed by a map signer
 // of the goatnet, so it verifies against the same trust set as a map, and it
 // may arrive from management or from any peer: the signature carries the
 // trust, not the carrier.
@@ -49,15 +50,14 @@ var (
 
 // Revocation is the signed content.
 type Revocation struct {
-	GoatnetID         string `json:"goatnet_id"`
-	PeerKey           string `json:"peer_key"`
-	ThresholdUnixNano int64  `json:"threshold_unix_nano"`
-	IssuedAtUnixNano  int64  `json:"issued_at_unix_nano"`
-	Reason            string `json:"reason,omitempty"`
+	GoatnetID        string `json:"goatnet_id"`
+	PeerKey          string `json:"peer_key"`
+	IssuedAtUnixNano int64  `json:"issued_at_unix_nano"`
+	Reason           string `json:"reason,omitempty"`
 }
 
-// Threshold returns the revocation's threshold time.
-func (r *Revocation) Threshold() time.Time { return time.Unix(0, r.ThresholdUnixNano) }
+// IssuedAt returns when the revocation was signed.
+func (r *Revocation) IssuedAt() time.Time { return time.Unix(0, r.IssuedAtUnixNano) }
 
 // Signed is a revocation as encoded once by its signer.
 type Signed struct {
@@ -86,8 +86,8 @@ func signedBytes(b []byte) []byte {
 
 // Sign encodes r once and signs it with key.
 func Sign(r *Revocation, key ed25519.PrivateKey) (*Signed, error) {
-	if r.GoatnetID == "" || r.PeerKey == "" || r.ThresholdUnixNano == 0 {
-		return nil, fmt.Errorf("%w: goatnet, peer key and threshold are required", ErrMalformed)
+	if r.GoatnetID == "" || r.PeerKey == "" {
+		return nil, fmt.Errorf("%w: goatnet and peer key are required", ErrMalformed)
 	}
 	b, err := json.Marshal(r)
 	if err != nil {
@@ -113,8 +113,8 @@ func Parse(b []byte) (*Signed, error) {
 	if err := json.Unmarshal(s.Revocation, r); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
-	if r.PeerKey == "" || r.ThresholdUnixNano == 0 {
-		return nil, fmt.Errorf("%w: no peer key or threshold", ErrMalformed)
+	if r.PeerKey == "" {
+		return nil, fmt.Errorf("%w: no peer key", ErrMalformed)
 	}
 	s.rev = r
 	return s, nil
@@ -250,7 +250,7 @@ func (s *Store) Add(r *Signed) (bool, error) {
 	return true, nil
 }
 
-// All returns the held revocations, oldest threshold first.
+// All returns the held revocations, oldest first.
 func (s *Store) All() []*Signed {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -258,25 +258,8 @@ func (s *Store) All() []*Signed {
 	for _, r := range s.byID {
 		out = append(out, r)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].rev.ThresholdUnixNano < out[j].rev.ThresholdUnixNano })
+	sort.Slice(out, func(i, j int) bool { return out[i].rev.IssuedAtUnixNano < out[j].rev.IssuedAtUnixNano })
 	return out
-}
-
-// Expire drops revocations whose threshold is older than maxAge: every map
-// signed before such a threshold is itself too old to be used.
-func (s *Store) Expire(now time.Time, maxAge time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	changed := false
-	for id, r := range s.byID {
-		if now.Sub(r.rev.Threshold()) > maxAge {
-			delete(s.byID, id)
-			changed = true
-		}
-	}
-	if changed {
-		_ = s.write()
-	}
 }
 
 func (s *Store) write() error {
@@ -315,15 +298,10 @@ func (s *Store) write() error {
 	return os.Rename(name, s.path)
 }
 
-// Revoked reports whether peerKey is revoked for a map signed at signedAt.
-// A zero signedAt (an unsigned or cached map with no signing time) counts as
-// signed before every threshold.
-func Revoked(list []*Signed, peerKey string, signedAt time.Time) bool {
+// Revoked reports whether peerKey is revoked. A revocation never expires.
+func Revoked(list []*Signed, peerKey string) bool {
 	for _, r := range list {
-		if r.rev.PeerKey != peerKey {
-			continue
-		}
-		if signedAt.IsZero() || !signedAt.After(r.rev.Threshold()) {
+		if r.rev.PeerKey == peerKey {
 			return true
 		}
 	}

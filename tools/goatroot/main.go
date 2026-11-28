@@ -5,10 +5,11 @@
 //	goatroot pubkey -key key.pem               prints the document key entry of a key
 //	goatroot sign -doc doc.json -key k.pem -out signed.json [-key k2.pem ...]
 //	goatroot verify -held held.json [-candidate next.json]
-//	goatroot revoke -key signer.pem -goatnet ID -peer WGKEY -list revocations.json [-threshold RFC3339] [-reason text]
+//	goatroot revoke -key signer.pem -goatnet ID -peer WGKEY -list revocations.json [-reason text]
 //
 // revoke signs a revocation with a map signer's key and appends it to the
-// list management serves (GoatMapSigning.RevocationsFile).
+// list management serves (GoatMapSigning.RevocationsFile). A revoked key stays
+// revoked for good; a device comes back with a new key and a new enrollment.
 //
 // A first document must be signed by one of its own root keys; each later
 // version by a root key the version before it lists.
@@ -87,12 +88,11 @@ func run(args []string, out io.Writer) error {
 		goatnet := fs.String("goatnet", "", "goatnet ID")
 		peerKey := fs.String("peer", "", "WireGuard public key of the revoked peer")
 		listPath := fs.String("list", "", "revocation list to append to (created when missing)")
-		threshold := fs.String("threshold", "", "RFC 3339 time; maps signed at or before it are refused for this peer (default now)")
 		reason := fs.String("reason", "", "reason")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		return revoke(*keyPath, *goatnet, *peerKey, *listPath, *threshold, *reason, out)
+		return revoke(*keyPath, *goatnet, *peerKey, *listPath, *reason, out)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -209,7 +209,7 @@ func verify(heldPath, candidatePath string, out io.Writer) error {
 	return err
 }
 
-func revoke(keyPath, goatnet, peerKey, listPath, threshold, reason string, out io.Writer) error {
+func revoke(keyPath, goatnet, peerKey, listPath, reason string, out io.Writer) error {
 	if keyPath == "" || goatnet == "" || peerKey == "" || listPath == "" {
 		return errors.New("revoke needs -key, -goatnet, -peer and -list")
 	}
@@ -217,14 +217,7 @@ func revoke(keyPath, goatnet, peerKey, listPath, threshold, reason string, out i
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	at := now
-	if threshold != "" {
-		if at, err = time.Parse(time.RFC3339, threshold); err != nil {
-			return fmt.Errorf("-threshold: %w", err)
-		}
-	}
-	signed, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: goatnet, PeerKey: peerKey, ThresholdUnixNano: at.UnixNano(), IssuedAtUnixNano: now.UnixNano(), Reason: reason}, k)
+	signed, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: goatnet, PeerKey: peerKey, IssuedAtUnixNano: time.Now().UnixNano(), Reason: reason}, k)
 	if err != nil {
 		return err
 	}

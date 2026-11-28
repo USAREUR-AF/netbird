@@ -26,9 +26,9 @@ func keyPair(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
-func revoke(t *testing.T, key ed25519.PrivateKey, goatnet, peerKey string, threshold time.Time) *Signed {
+func revoke(t *testing.T, key ed25519.PrivateKey, goatnet, peerKey string, issued time.Time) *Signed {
 	t.Helper()
-	s, err := Sign(&Revocation{GoatnetID: goatnet, PeerKey: peerKey, ThresholdUnixNano: threshold.UnixNano(), IssuedAtUnixNano: time.Now().UnixNano()}, key)
+	s, err := Sign(&Revocation{GoatnetID: goatnet, PeerKey: peerKey, IssuedAtUnixNano: issued.UnixNano()}, key)
 	require.NoError(t, err)
 	b, err := s.Marshal()
 	require.NoError(t, err)
@@ -61,16 +61,11 @@ func TestVerify(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMalformed, "an oversized message is refused before decoding")
 }
 
-func TestRevokedSemantics(t *testing.T) {
+func TestRevokedIsAbsorbing(t *testing.T) {
 	_, priv := keyPair(t)
-	threshold := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
-	list := []*Signed{revoke(t, priv, "goatnet-1", "peer-c", threshold)}
-
-	assert.True(t, Revoked(list, "peer-c", threshold.Add(-time.Minute)), "a map signed before the threshold")
-	assert.True(t, Revoked(list, "peer-c", threshold), "a map signed at the threshold")
-	assert.False(t, Revoked(list, "peer-c", threshold.Add(time.Minute)), "a map signed after the threshold reinstates the peer")
-	assert.True(t, Revoked(list, "peer-c", time.Time{}), "an unsigned map counts as signed before every threshold")
-	assert.False(t, Revoked(list, "peer-a", time.Time{}), "another peer")
+	list := []*Signed{revoke(t, priv, "goatnet-1", "peer-c", time.Now().Add(-365*24*time.Hour))}
+	assert.True(t, Revoked(list, "peer-c"), "a revocation never expires")
+	assert.False(t, Revoked(list, "peer-a"), "another peer")
 }
 
 func TestStoreIsDurableAndDeduplicates(t *testing.T) {
@@ -101,8 +96,9 @@ func TestStoreIsDurableAndDeduplicates(t *testing.T) {
 	old := revoke(t, priv, "goatnet-1", "peer-d", time.Now().Add(-100*time.Hour))
 	_, err = reopened.Add(old)
 	require.NoError(t, err)
-	reopened.Expire(time.Now(), 72*time.Hour)
-	require.Len(t, reopened.All(), 1, "a revocation whose threshold is older than the maximum map age is dropped")
+	again, err := OpenStore(path)
+	require.NoError(t, err)
+	require.Len(t, again.All(), 2, "an old revocation is kept: revocations are absorbing")
 }
 
 func TestSyncResponseField(t *testing.T) {
