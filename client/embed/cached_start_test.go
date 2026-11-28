@@ -3,6 +3,7 @@ package embed
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -53,7 +54,18 @@ func silentServer(t *testing.T) string {
 // after one short dial for the login and one for the engine, instead of the
 // minutes of 30 s attempts a client without a cache spends.
 func TestStartFromCachedMapIsQuick(t *testing.T) {
-	dir := t.TempDir()
+	// Not t.TempDir: the stopped client may still finish writing its state file
+	// for a moment, and t.TempDir fails the test when its removal races that.
+	dir, err := os.MkdirTemp("", "cached-start-")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		for i := 0; i < 50; i++ {
+			if os.RemoveAll(dir) == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
 	mgmtAddr := silentServer(t)
 	signalAddr := silentServer(t)
 	configPath := filepath.Join(dir, "config.json")

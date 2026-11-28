@@ -78,9 +78,7 @@ func (s *Signed) ID() string {
 }
 
 func signedBytes(b []byte) []byte {
-	out := make([]byte, 0, len(Domain)+1+len(b))
-	out = append(out, Domain...)
-	out = append(out, 0)
+	out := append([]byte(Domain), 0)
 	return append(out, b...)
 }
 
