@@ -185,6 +185,8 @@ type EngineServices struct {
 	Revocations *goatrevoke.Store
 	// RevocationPort is the overlay UDP port for revocations between peers; zero means DefaultRevocationPort.
 	RevocationPort int
+	// CertificatePath is where membership certificates are kept on disk; empty keeps them in memory.
+	CertificatePath string
 }
 
 // Engine is a mechanism responsible for reacting on Signal and Management stream events and managing connections to the remote peers.
@@ -361,6 +363,7 @@ func NewEngine(
 		revStore:           services.Revocations,
 		revPort:            services.RevocationPort,
 	}
+	engine.setCertificatePath(services.CertificatePath)
 	if engine.mapMaxAge <= 0 {
 		engine.mapMaxAge = mapcache.DefaultMaxAge
 	}

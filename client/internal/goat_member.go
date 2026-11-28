@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -48,6 +51,68 @@ type memberState struct {
 	added   map[string]time.Time          // remote peer key -> when it was added, for the grace period
 	refused map[string]string             // remote peer key -> why it is refused
 	lastMap *mgmProto.NetworkMap          // last map applied, to re-admit a peer without a new map
+	path    string                        // where the certificates are kept on disk; empty keeps them in memory
+}
+
+// certFile is the on-disk form of the certificates a client holds.
+type certFile struct {
+	Own  json.RawMessage            `json:"own,omitempty"`
+	Held map[string]json.RawMessage `json:"held,omitempty"`
+}
+
+// saveCertificates writes the own and held certificates, owner-only and
+// atomically. The caller holds syncMsgMux.
+func (e *Engine) saveCertificates() {
+	if e.member.path == "" {
+		return
+	}
+	f := certFile{Held: map[string]json.RawMessage{}}
+	if e.member.own != nil {
+		if b, err := e.member.own.Marshal(); err == nil {
+			f.Own = b
+		}
+	}
+	for k, c := range e.member.held {
+		if b, err := c.Marshal(); err == nil {
+			f.Held[k] = b
+		}
+	}
+	b, err := json.Marshal(f)
+	if err != nil {
+		return
+	}
+	if err := writeOwnerOnly(e.member.path, b); err != nil {
+		log.Warnf("failed to keep the membership certificates on disk: %v", err)
+	}
+}
+
+// loadCertificates reads the certificates kept on disk, keeping those that
+// verify and were issued within the maximum map age. The caller holds syncMsgMux.
+func (e *Engine) loadCertificates(now time.Time) {
+	if e.member.path == "" || e.mapTrust == nil {
+		return
+	}
+	b, err := os.ReadFile(e.member.path)
+	if err != nil {
+		return
+	}
+	var f certFile
+	if json.Unmarshal(b, &f) != nil {
+		return
+	}
+	fresh := func(c *goatmember.Signed) bool { return now.Sub(c.Cert().IssuedAt()) <= e.mapMaxAge }
+	me := e.config.WgPrivateKey.PublicKey().String()
+	if len(f.Own) > 0 {
+		if c, err := goatmember.Parse(f.Own); err == nil && goatmember.Verify(e.mapTrust, c, me) == nil && fresh(c) {
+			e.member.own = c
+		}
+	}
+	for k, raw := range f.Held {
+		if c, err := goatmember.Parse(raw); err == nil && fresh(c) {
+			e.holdCertificate(k, c)
+		}
+	}
+	log.Infof("membership certificates from disk: own %t, %d held", e.member.own != nil, len(e.member.held))
 }
 
 // peerKeyForOverlay returns the key of the peer whose first allowed IP is ip.
@@ -75,6 +140,7 @@ func (e *Engine) acceptCertificates(update *mgmProto.SyncResponse) {
 			log.Warnf("ignoring this peer's membership certificate: %v", err)
 		} else {
 			e.member.own = own
+			e.saveCertificates()
 		}
 	}
 	for _, c := range remote {
@@ -97,6 +163,7 @@ func (e *Engine) holdCertificate(peerKey string, c *goatmember.Signed) {
 		return
 	}
 	e.member.held[peerKey] = c
+	e.saveCertificates()
 }
 
 // certificateRefusal returns why peerKey is refused, or "" when it is accepted.
@@ -244,9 +311,45 @@ func (e *Engine) startMembership() {
 	if e.mapTrust == nil {
 		return
 	}
+	e.loadCertificates(time.Now())
 	e.shutdownWg.Add(1)
 	go func() {
 		defer e.shutdownWg.Done()
 		e.runMembership()
 	}()
 }
+
+// certificatePathFor returns where certificates are kept beside the cached map.
+func certificatePathFor(cachePath string) string {
+	if cachePath == "" {
+		return ""
+	}
+	return strings.TrimSuffix(cachePath, ".goat-map.json") + ".goat-certificates.json"
+}
+
+func writeOwnerOnly(path string, b []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+func (e *Engine) setCertificatePath(path string) { e.member.path = path }

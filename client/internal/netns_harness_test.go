@@ -444,6 +444,7 @@ func TestNetns_RestartFromCachedMap(t *testing.T) {
 const (
 	extraTrustFile    = "trust_file"
 	extraRevStore     = "revocation_store"
+	extraCertStore    = "certificate_store"
 	statusRevs        = "revocations"
 	statusRevListings = "revoked_listings"
 )
@@ -462,6 +463,7 @@ func init() {
 			panic(err)
 		}
 		e.mapTrust, e.revStore = trust, store
+		e.member.path = s.Extra[extraCertStore]
 	})
 	helperStatusHooks = append(helperStatusHooks, func(e *Engine, extra map[string]any) {
 		if e.revStore != nil {
@@ -646,6 +648,7 @@ func TestNetns_MembershipCertificates(t *testing.T) {
 		peers[i].settings.Extra = map[string]string{
 			extraTrustFile: trustPath,
 			extraRevStore:  filepath.Join(dir, fmt.Sprintf("peer%d.goat-revocations.json", i)),
+			extraCertStore: filepath.Join(dir, fmt.Sprintf("peer%d.goat-certificates.json", i)),
 		}
 		peers[i].start(t)
 	}
@@ -696,4 +699,23 @@ func TestNetns_MembershipCertificates(t *testing.T) {
 	}
 	require.True(t, a.ping(b.overlayIP()) && a.ping(c.overlayIP()) && b.ping(c.overlayIP()), "all three reach each other after three windows without management")
 	t.Logf("island of 3: 0 refusals and all pings answered %s (3 windows) after management became unreachable", time.Since(islandAt).Round(time.Second))
+
+	// 5. On the island, A restarts from its cached map. Its certificates come
+	// back from disk, so it checks them before management answers.
+	certPath := a.settings.Extra[extraCertStore]
+	fi, err := os.Stat(certPath)
+	require.NoError(t, err, "A keeps its certificates on disk")
+	require.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "the certificate file is owner-only")
+	a.stop(t)
+	restarted := time.Now()
+	a.settings.FromCache = true
+	a.start(t)
+	waitFor(t, 30*time.Second, "A to run from its cache holding its own and two peers' certificates from disk", func() bool {
+		s := a.status()
+		own, _ := s.Extra[statusOwnCert].(bool)
+		return s.Running && s.RunningFromCache && own && num(a, statusHeld) == 2
+	})
+	waitFor(t, 60*time.Second, "A reaches B and C again on the island", func() bool { return a.ping(b.overlayIP()) && a.ping(c.overlayIP()) })
+	require.Zero(t, num(a, statusRefused), "A refuses neither: the certificates from disk agree")
+	t.Logf("A restarted on the island with its certificates from disk and reached both peers %s later", time.Since(restarted).Round(time.Millisecond))
 }

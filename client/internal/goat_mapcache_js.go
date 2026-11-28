@@ -49,3 +49,7 @@ func (e *Engine) acceptCertificates(*mgmProto.SyncResponse) {}
 func (e *Engine) noteMap(*mgmProto.NetworkMap) {}
 
 func (e *Engine) refusedByCertificate(string) bool { return false }
+
+func (e *Engine) setCertificatePath(string) {}
+
+func certificatePathFor(string) string { return "" }
