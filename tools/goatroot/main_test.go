@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/goatroot"
 )
 
@@ -55,4 +56,19 @@ func TestIssueChain(t *testing.T) {
 	assert.Error(t, run([]string{"verify", "-held", path("v2.self.json"), "-candidate", path("v3.bad.json")}, &bytes.Buffer{}), "version 3 must be signed by the root key version 2 lists")
 	assert.Error(t, run([]string{"verify", "-held", path("v1.signed.json"), "-candidate", path("v1.signed.json")}, &bytes.Buffer{}), "not newer")
 	assert.Error(t, run([]string{"keygen", "-out", path("root.pem")}, &bytes.Buffer{}), "keygen never overwrites a key")
+}
+
+func TestRevokeAppendsToTheList(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	require.NoError(t, run([]string{"keygen", "-out", filepath.Join(dir, "signer.pem")}, &out))
+	list := filepath.Join(dir, "revocations.json")
+	for _, peer := range []string{"peer-c", "peer-d"} {
+		require.NoError(t, run([]string{"revoke", "-key", filepath.Join(dir, "signer.pem"), "-goatnet", "goatnet-1", "-peer", peer, "-list", list}, &bytes.Buffer{}))
+	}
+	got, err := goatrevoke.LoadList(list)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "peer-d", got[1].Rev().PeerKey)
+	assert.Error(t, run([]string{"revoke", "-key", filepath.Join(dir, "signer.pem"), "-goatnet", "goatnet-1", "-list", list}, &bytes.Buffer{}), "a peer key is required")
 }

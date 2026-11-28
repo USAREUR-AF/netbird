@@ -65,6 +65,7 @@ import (
 	"github.com/netbirdio/netbird/route"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	"github.com/netbirdio/netbird/shared/management/domain"
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
@@ -180,6 +181,10 @@ type EngineServices struct {
 	RootDocument *goatroot.Signed
 	// RootDocumentPath is where a newer root document is written.
 	RootDocumentPath string
+	// Revocations is the durable store of verified revocations; used only with MapTrust.
+	Revocations *goatrevoke.Store
+	// RevocationPort is the overlay UDP port for revocations between peers; zero means DefaultRevocationPort.
+	RevocationPort int
 }
 
 // Engine is a mechanism responsible for reacting on Signal and Management stream events and managing connections to the remote peers.
@@ -296,6 +301,13 @@ type Engine struct {
 	rootDoc           *goatroot.Signed
 	rootDocPath       string
 	mapMaxAgeOverride time.Duration
+
+	revStore *goatrevoke.Store
+	revConn  net.PacketConn
+	revPort  int
+	// currentMapSignedAt is the signing time of the map being applied, zero
+	// for an unsigned map. Protected by syncMsgMux.
+	currentMapSignedAt time.Time
 }
 
 // Peer is an instance of the Connection Peer
@@ -344,6 +356,8 @@ func NewEngine(
 		mapMaxAgeOverride:  services.MapMaxAgeOverride,
 		rootDoc:            services.RootDocument,
 		rootDocPath:        services.RootDocumentPath,
+		revStore:           services.Revocations,
+		revPort:            services.RevocationPort,
 	}
 	if engine.mapMaxAge <= 0 {
 		engine.mapMaxAge = mapcache.DefaultMaxAge
@@ -629,6 +643,9 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	e.srWatcher.Start(peer.IsForceRelayed())
 
 	e.lastVerifiedMap = time.Now()
+	if err := e.startRevocations(); err != nil {
+		log.Warnf("revocations from peers are not received: %v", err)
+	}
 	if e.cachedStart != nil {
 		if err := e.applyCachedMap(e.cachedStart); err != nil {
 			e.close()
@@ -950,6 +967,15 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 	if nm != nil && nm.PeerConfig != nil {
 		e.handleAutoUpdateVersion(nm.PeerConfig.AutoUpdate)
 	}
+	if nm != nil {
+		e.currentMapSignedAt = time.Time{}
+		if signed != nil {
+			if env, err := mapsign.Open(signed); err == nil {
+				e.currentMapSignedAt = env.IssuedAt()
+			}
+		}
+	}
+	e.acceptRevocations(update)
 
 	if update.GetNetbirdConfig() != nil {
 		wCfg := update.GetNetbirdConfig()
@@ -1140,6 +1166,12 @@ func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
 	}
 	age, _ := entry.Age(mapcache.SystemClock)
 	endpoints := entry.DirectEndpoints()
+	e.currentMapSignedAt = time.Time{}
+	if signed, err := entry.Signed(); err == nil && signed != nil {
+		if env, err := mapsign.Open(signed); err == nil {
+			e.currentMapSignedAt = env.IssuedAt()
+		}
+	}
 	e.lastVerifiedMap = time.Now().Add(-age)
 
 	e.runningFromCache = true
@@ -1572,7 +1604,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 	localPubKey := e.config.WgPrivateKey.PublicKey().String()
 	remotePeers := make([]*mgmProto.RemotePeerConfig, 0, len(networkMap.GetRemotePeers()))
 	for _, p := range networkMap.GetRemotePeers() {
-		if p.GetWgPubKey() != localPubKey {
+		if p.GetWgPubKey() != localPubKey && !e.revokedNow(p.GetWgPubKey()) {
 			remotePeers = append(remotePeers, p)
 		}
 	}

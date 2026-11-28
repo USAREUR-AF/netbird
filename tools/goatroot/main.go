@@ -5,6 +5,10 @@
 //	goatroot pubkey -key key.pem               prints the document key entry of a key
 //	goatroot sign -doc doc.json -key k.pem -out signed.json [-key k2.pem ...]
 //	goatroot verify -held held.json [-candidate next.json]
+//	goatroot revoke -key signer.pem -goatnet ID -peer WGKEY -list revocations.json [-threshold RFC3339] [-reason text]
+//
+// revoke signs a revocation with a map signer's key and appends it to the
+// list management serves (GoatMapSigning.RevocationsFile).
 //
 // A first document must be signed by one of its own root keys; each later
 // version by a root key the version before it lists.
@@ -22,7 +26,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/goatroot"
 )
 
@@ -76,6 +82,17 @@ func run(args []string, out io.Writer) error {
 			return err
 		}
 		return verify(*held, *candidate, out)
+	case "revoke":
+		keyPath := fs.String("key", "", "map signer key file")
+		goatnet := fs.String("goatnet", "", "goatnet ID")
+		peerKey := fs.String("peer", "", "WireGuard public key of the revoked peer")
+		listPath := fs.String("list", "", "revocation list to append to (created when missing)")
+		threshold := fs.String("threshold", "", "RFC 3339 time; maps signed at or before it are refused for this peer (default now)")
+		reason := fs.String("reason", "", "reason")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return revoke(*keyPath, *goatnet, *peerKey, *listPath, *threshold, *reason, out)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -189,5 +206,52 @@ func verify(heldPath, candidatePath string, out io.Writer) error {
 		return err
 	}
 	_, err = fmt.Fprintf(out, "ok: version %d may replace version %d\n", candidate.Doc().Version, held.Doc().Version)
+	return err
+}
+
+func revoke(keyPath, goatnet, peerKey, listPath, threshold, reason string, out io.Writer) error {
+	if keyPath == "" || goatnet == "" || peerKey == "" || listPath == "" {
+		return errors.New("revoke needs -key, -goatnet, -peer and -list")
+	}
+	k, err := readKey(keyPath)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	at := now
+	if threshold != "" {
+		if at, err = time.Parse(time.RFC3339, threshold); err != nil {
+			return fmt.Errorf("-threshold: %w", err)
+		}
+	}
+	signed, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: goatnet, PeerKey: peerKey, ThresholdUnixNano: at.UnixNano(), IssuedAtUnixNano: now.UnixNano(), Reason: reason}, k)
+	if err != nil {
+		return err
+	}
+	var list []json.RawMessage
+	if b, err := os.ReadFile(listPath); err == nil {
+		if err := json.Unmarshal(b, &list); err != nil {
+			return fmt.Errorf("parse %s: %w", listPath, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	b, err := signed.Marshal()
+	if err != nil {
+		return err
+	}
+	list = append(list, b)
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := listPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, listPath); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(out, "revocation %s of %s appended to %s (%d in the list)\n", signed.ID(), peerKey, listPath, len(list))
 	return err
 }

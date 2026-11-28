@@ -342,6 +342,13 @@ func MarshalTrustFile(goatnetID string, keys ...ed25519.PublicKey) ([]byte, erro
 	return json.MarshalIndent(tf, "", "  ")
 }
 
+// VerifyBytes reports whether sig is a valid signature of msg by the trusted
+// key keyID. Other signed goatnet objects (revocations) use it.
+func (t *TrustSet) VerifyBytes(keyID string, msg, sig []byte) bool {
+	pub, ok := t.keys[keyID]
+	return ok && ed25519.Verify(pub, msg, sig)
+}
+
 // Verify checks signed against the trust set for the peer peerKey and returns its envelope.
 func (t *TrustSet) Verify(peerKey string, signed *SignedMap) (*Envelope, error) {
 	if signed == nil || len(signed.Envelope) == 0 {
