@@ -61,8 +61,14 @@ jobs:
 
           echo "Size: ${SIZE} bytes (${SIZE_MB} MB)"
 
-          if [ ${SIZE} -gt 58720256 ]; then
-            echo "Wasm binary size (${SIZE_MB}MB) exceeds 56MB limit!"
+          # Limit 57 MiB (59768832 bytes), raised from upstream's 56 MiB (58720256) on the fork.
+          # Measured in CI: 58551494 bytes before the goat changes (f431fc610), 58743424 with
+          # ADR 1273 phases 1 to 3 before the js stubs. Measured locally (CI reads about
+          # 2.5 KB more): 58697512 on main at 545b434f7, 58706611 with phases 3 to 5 (#5 to #9).
+          # The extra MiB is for upstream growth between syncs; move it with an upstream sync,
+          # with the new measurements recorded here.
+          if [ ${SIZE} -gt 59768832 ]; then
+            echo "Wasm binary size (${SIZE_MB}MB) exceeds 57MB limit!"
             exit 1
           fi
 
