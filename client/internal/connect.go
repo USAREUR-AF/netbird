@@ -40,6 +40,7 @@ import (
 	sshconfig "github.com/netbirdio/netbird/client/ssh/config"
 	"github.com/netbirdio/netbird/client/system"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
@@ -437,6 +438,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			UpdateManager:     c.updateManager,
 			ClientMetrics:     c.clientMetrics,
 			MapCache:          mapStore,
+			Revocations:       revocationStoreFor(trustCfg, cachePath),
 			MapTrust:          trustCfg.Trust,
 			MapMaxAge:         trustCfg.MaxAge,
 			MapMaxAgeOverride: trustCfg.MaxAgeOverride,
@@ -788,3 +790,11 @@ func closeConnWithLog(conn *net.UDPConn) {
 // CachedStartDialTimeout bounds the one management dial of a client that can
 // start from its cached network map.
 const CachedStartDialTimeout = 3 * time.Second
+
+// revocationStoreFor returns the client's revocation store, or nil without a trust set.
+func revocationStoreFor(cfg *mapcache.TrustConfig, cachePath string) *goatrevoke.Store {
+	if cfg == nil || cfg.Trust == nil {
+		return nil
+	}
+	return newRevocationStore(cachePath)
+}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/netbirdio/netbird/client/internal/mapcache"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
@@ -30,3 +31,11 @@ func usableCachedMap(string, mapcache.Binding, *mapcache.TrustConfig) *mapcache.
 func HasUsableCachedMap(*profilemanager.Config, string) bool { return false }
 
 func (e *Engine) applyRootDocument(*mgmProto.SyncResponse) {}
+
+func (e *Engine) startRevocations() error { return nil }
+
+func (e *Engine) acceptRevocations(*mgmProto.SyncResponse) {}
+
+func (e *Engine) revokedNow(string) bool { return false }
+
+func newRevocationStore(string) *goatrevoke.Store { return nil }

@@ -79,6 +79,9 @@ type GoatMapSigning struct {
 	// RootDocumentFile, when set, is the goatnet root document (goatroot.Signed) sent
 	// with every sync response. It is read again when the file changes.
 	RootDocumentFile string
+	// RevocationsFile, when set, is a JSON list of signed revocations (goatrevoke)
+	// sent with every sync response. It is read again when the file changes.
+	RevocationsFile string
 }
 
 // GetAuthAudiences returns the audience from the http config and device authorization flow config

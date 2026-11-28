@@ -15,7 +15,10 @@ package internal
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -37,9 +40,13 @@ import (
 	"github.com/netbirdio/netbird/client/internal/mapcache"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/management/internals/server/config"
 	mgmt "github.com/netbirdio/netbird/shared/management/client"
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
+	"github.com/netbirdio/netbird/shared/management/mapsign"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
 	signal_ "github.com/netbirdio/netbird/shared/signal/client"
+	"github.com/netbirdio/netbird/util"
 )
 
 const (
@@ -431,4 +438,152 @@ func TestNetns_RestartFromCachedMap(t *testing.T) {
 	require.Equal(t, cachedEndpoint, w.Endpoint, "A reaches B on the cached direct endpoint\n%s", a.logs())
 	require.Greater(t, w.LastHandshake, restarted.UnixNano(), "a new handshake after the restart")
 	t.Logf("separate namespaces: overlay ping both ways %s after A restarted from its cache, endpoint %s", time.Since(restarted).Round(time.Millisecond), w.Endpoint)
+}
+
+// Settings for a peer process that verifies maps and keeps revocations.
+const (
+	extraTrustFile    = "trust_file"
+	extraRevStore     = "revocation_store"
+	statusRevs        = "revocations"
+	statusRevListings = "revoked_listings"
+)
+
+func init() {
+	helperEngineHooks = append(helperEngineHooks, func(e *Engine, s *helperSettings) {
+		if s.Extra[extraTrustFile] == "" {
+			return
+		}
+		trust, err := mapsign.LoadTrustFile(s.Extra[extraTrustFile])
+		if err != nil {
+			panic(err)
+		}
+		store, err := goatrevoke.OpenStore(s.Extra[extraRevStore])
+		if err != nil {
+			panic(err)
+		}
+		e.mapTrust, e.revStore = trust, store
+	})
+	helperStatusHooks = append(helperStatusHooks, func(e *Engine, extra map[string]any) {
+		if e.revStore != nil {
+			extra[statusRevs] = len(e.revStore.All())
+			extra[statusRevListings] = e.RevokedListings()
+		}
+	})
+}
+
+// TestNetns_RevocationFloods: three peers in separate namespaces on a signing
+// management. Peer B loses its path to management. A revocation of peer C is
+// added to management's list; peer A receives it from management, removes C,
+// and floods it over the overlay to B, which removes C although it cannot
+// reach management. B keeps the revocation on disk: restarted from its cached
+// map with management still unreachable, it leaves C out.
+func TestNetns_RevocationFloods(t *testing.T) {
+	netnsAvailable(t)
+	netnsTopology(t, 3)
+	dir := t.TempDir()
+
+	keyPath, signerPub := writeSigningKey(t, dir)
+	trustData, err := mapsign.MarshalTrustFile("goatnet-test", signerPub)
+	require.NoError(t, err)
+	trustPath := filepath.Join(dir, "map-trust.json")
+	require.NoError(t, os.WriteFile(trustPath, trustData, 0o644))
+	revList := filepath.Join(dir, "revocations.json")
+	require.NoError(t, os.WriteFile(revList, []byte("[]"), 0o644))
+
+	var mgmtAddr string
+	sigServer, signalAddr, err := startSignal(t)
+	require.NoError(t, err)
+	t.Cleanup(sigServer.Stop)
+	_, mgmtAddr, err = startManagementWithConfig(t, t.TempDir(), "../testdata/store.sql", func(c *config.Config) {
+		c.GoatMapSigning = &config.GoatMapSigning{GoatnetID: "goatnet-test", KeyFile: keyPath, RefreshInterval: util.Duration{Duration: 2 * time.Second}, RevocationsFile: revList}
+	})
+	require.NoError(t, err)
+	signalGate := newTCPGateOn(t, netnsBridgeAddr+":0", signalAddr)
+
+	peers := make([]*netnsPeer, 3)
+	gates := make([]*tcpGate, 3)
+	for i := range peers {
+		gates[i] = newTCPGateOn(t, netnsBridgeAddr+":0", mgmtAddr)
+		peers[i] = newNetnsPeer(t, dir, i, gates[i].addr, signalGate.addr)
+		peers[i].settings.Extra = map[string]string{
+			extraTrustFile: trustPath,
+			extraRevStore:  filepath.Join(dir, fmt.Sprintf("peer%d.goat-revocations.json", i)),
+		}
+		peers[i].start(t)
+	}
+	a, b, c := peers[0], peers[1], peers[2]
+	revs := func(p *netnsPeer) int {
+		v, _ := p.status().Extra[statusRevs].(float64)
+		return int(v)
+	}
+
+	waitFor(t, 120*time.Second, "all three peers connected to each other", func() bool {
+		return a.status().Connected == 2 && b.status().Connected == 2 && c.status().Connected == 2
+	})
+	waitFor(t, 30*time.Second, "overlay pings B to A and B to C", func() bool { return b.ping(a.overlayIP()) && b.ping(c.overlayIP()) })
+
+	// B loses management. Then management's list gains a revocation of C.
+	// Management keeps listing C in its maps: revocations are absorbing, so
+	// A must keep C out of every later map and count each listing it refuses.
+	gates[1].down()
+	signer, err := readSigningKey(keyPath)
+	require.NoError(t, err)
+	rev, err := goatrevoke.Sign(&goatrevoke.Revocation{GoatnetID: "goatnet-test", PeerKey: c.key.PublicKey().String(), IssuedAtUnixNano: time.Now().UnixNano()}, signer)
+	require.NoError(t, err)
+	revBytes, err := rev.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(revList, []byte("["+string(revBytes)+"]"), 0o644))
+	revokedAt := time.Now()
+
+	waitFor(t, 30*time.Second, "A to take the revocation from management and remove C", func() bool {
+		_, hasC := a.wg(c)
+		return revs(a) == 1 && !hasC
+	})
+	waitFor(t, 30*time.Second, "B to receive the revocation from a peer and remove C", func() bool {
+		_, hasC := b.wg(c)
+		return revs(b) == 1 && !hasC && b.status().Peers == 1
+	})
+	t.Logf("revocation of C reached B, which has no path to management, %s after it was issued", time.Since(revokedAt).Round(time.Millisecond))
+	require.False(t, b.ping(c.overlayIP()), "B no longer reaches C")
+	require.True(t, b.ping(a.overlayIP()), "B still reaches A")
+
+	// Management's later maps (refreshed every 2 s) still list C; A keeps it out.
+	listings := func(p *netnsPeer) int {
+		v, _ := p.status().Extra[statusRevListings].(float64)
+		return int(v)
+	}
+	before := listings(a)
+	time.Sleep(5 * time.Second)
+	_, aHasC := a.wg(c)
+	require.False(t, aHasC, "later maps listing C still leave C out")
+	require.Greater(t, listings(a), before, "A counted the maps that listed revoked peer C")
+	t.Logf("A refused %d listings of revoked peer C in management's later maps", listings(a))
+
+	// B restarts from its cached map with management unreachable: the stored revocation still applies.
+	b.stop(t)
+	b.settings.FromCache = true
+	b.start(t)
+	waitFor(t, 60*time.Second, "B to run from its cached map with A only", func() bool {
+		s := b.status()
+		_, hasC := b.wg(c)
+		return s.Running && s.RunningFromCache && s.Peers == 1 && !hasC && revs(b) == 1
+	})
+	waitFor(t, 30*time.Second, "B reaches A after the restart", func() bool { return b.ping(a.overlayIP()) })
+	require.False(t, b.ping(c.overlayIP()), "after the restart B still does not reach C")
+}
+
+func readSigningKey(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in %s", path)
+	}
+	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return k.(ed25519.PrivateKey), nil
 }

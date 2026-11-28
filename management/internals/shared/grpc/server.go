@@ -46,6 +46,7 @@ import (
 	"github.com/netbirdio/netbird/management/server/settings"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	"github.com/netbirdio/netbird/shared/management/proto"
@@ -94,6 +95,8 @@ type Server struct {
 	mapSigner *mapsign.Signer
 	// rootDocument is the goatnet root document sent with every sync response; nil when not configured.
 	rootDocument *rootDocumentFile
+	// revocations is the revocation list sent with every sync response; nil when not configured.
+	revocations *revocationsFile
 }
 
 // NewServer creates a new Management server
@@ -155,7 +158,16 @@ func NewServer(
 		}
 	}
 
+	var revocations *revocationsFile
+	if ms := config.GoatMapSigning; ms != nil && ms.RevocationsFile != "" {
+		revocations = &revocationsFile{path: ms.RevocationsFile}
+		if _, err := revocations.get(); err != nil {
+			return nil, fmt.Errorf("revocations file: %w", err)
+		}
+	}
+
 	return &Server{
+		revocations:              revocations,
 		mapSigner:                mapSigner,
 		rootDocument:             rootDocument,
 		jobManager:               jobManager,
@@ -551,19 +563,31 @@ func (s *Server) goatSyncResponse(peerKey wgtypes.Key, resp *proto.SyncResponse)
 	if err != nil {
 		return nil, err
 	}
-	if s.rootDocument == nil {
-		return out, nil
+	if s.rootDocument != nil {
+		doc, err := s.rootDocument.get()
+		if err != nil {
+			log.Warnf("not sending the goatnet root document: %v", err)
+		} else {
+			if out == resp {
+				out = gproto.Clone(resp).(*proto.SyncResponse)
+			}
+			if err := goatroot.Attach(out, doc); err != nil {
+				return nil, err
+			}
+		}
 	}
-	doc, err := s.rootDocument.get()
-	if err != nil {
-		log.Warnf("not sending the goatnet root document: %v", err)
-		return out, nil
-	}
-	if out == resp {
-		out = gproto.Clone(resp).(*proto.SyncResponse)
-	}
-	if err := goatroot.Attach(out, doc); err != nil {
-		return nil, err
+	if s.revocations != nil {
+		list, err := s.revocations.get()
+		if err != nil {
+			log.Warnf("not sending revocations: %v", err)
+		} else if len(list) > 0 {
+			if out == resp {
+				out = gproto.Clone(resp).(*proto.SyncResponse)
+			}
+			if err := goatrevoke.Attach(out, list); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return out, nil
 }
