@@ -128,13 +128,14 @@ func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 
 	operation := func() error {
 		var err error
-		if lazy {
+		switch {
+		case lazy:
 			conn, err = nbgrpc.CreateConnectionLazy(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
-		} else if dialTimeout > 0 {
+		case dialTimeout > 0:
 			dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 			defer cancel()
 			conn, err = nbgrpc.CreateConnection(dialCtx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
-		} else {
+		default:
 			conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
 		}
 		if err != nil {
