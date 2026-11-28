@@ -99,17 +99,25 @@ func MaxRecvMsgSize() int {
 
 // NewClient creates a new client to Management service
 func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
-	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, false)
+	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, false, 0)
+}
+
+// NewClientWithDialTimeout creates a Management client with a single connection
+// attempt bounded by timeout, instead of the retries and 30 s attempts of
+// NewClient. A client that can start from its cached network map uses it, so
+// an unreachable management delays the start by at most timeout.
+func NewClientWithDialTimeout(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool, timeout time.Duration) (*GrpcClient, error) {
+	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, false, timeout)
 }
 
 // NewClientLazy creates a Management client without waiting for the server to answer.
 // The connection is made in the background; Sync and the other streams wait for it.
 // Used when the client starts from a cached network map while management is unreachable.
 func NewClientLazy(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
-	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, true)
+	return newClient(ctx, addr, ourPrivateKey, tlsEnabled, true, 0)
 }
 
-func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool, lazy bool) (*GrpcClient, error) {
+func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsEnabled bool, lazy bool, dialTimeout time.Duration) (*GrpcClient, error) {
 	var conn *grpc.ClientConn
 
 	var extraOpts []grpc.DialOption
@@ -120,9 +128,14 @@ func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 
 	operation := func() error {
 		var err error
-		if lazy {
+		switch {
+		case lazy:
 			conn, err = nbgrpc.CreateConnectionLazy(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
-		} else {
+		case dialTimeout > 0:
+			dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+			defer cancel()
+			conn, err = nbgrpc.CreateConnection(dialCtx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
+		default:
 			conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.ManagementComponent, extraOpts...)
 		}
 		if err != nil {
@@ -131,7 +144,12 @@ func newClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 		return nil
 	}
 
-	err := backoff.Retry(operation, nbgrpc.Backoff(ctx))
+	var err error
+	if dialTimeout > 0 {
+		err = operation()
+	} else {
+		err = backoff.Retry(operation, nbgrpc.Backoff(ctx))
+	}
 	if err != nil {
 		log.Errorf("failed creating connection to Management Service: %v", err)
 		return nil, err

@@ -13,6 +13,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	wgnetstack "golang.zx2c4.com/wireguard/tun/netstack"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/iface/netstack"
@@ -22,6 +23,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	sshcommon "github.com/netbirdio/netbird/client/ssh"
 	"github.com/netbirdio/netbird/client/system"
+	mgm "github.com/netbirdio/netbird/shared/management/client"
 	"github.com/netbirdio/netbird/shared/management/domain"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/util/capture"
@@ -267,6 +269,19 @@ func (c *Client) Start(startCtx context.Context) error {
 // client has a usable cached network map, it returns nil so the client starts
 // from that map; a refusal by management is always returned.
 func (c *Client) login(ctx context.Context) error {
+	if c.canStartFromCachedMap() {
+		// One short dial first: an unreachable management then costs
+		// CachedStartDialTimeout, not the auth client's minutes of retries.
+		key, err := wgtypes.ParseKey(c.config.PrivateKey)
+		if err == nil {
+			probe, err := mgm.NewClientWithDialTimeout(ctx, c.config.ManagementURL.Host, key, c.config.ManagementURL.Scheme == "https", internal.CachedStartDialTimeout)
+			if err != nil {
+				logrus.Warnf("management is unreachable (%v); starting from the cached network map", err)
+				return nil
+			}
+			_ = probe.Close()
+		}
+	}
 	authClient, err := auth.NewAuth(ctx, c.config.PrivateKey, c.config.ManagementURL, c.config)
 	if err != nil {
 		if c.canStartFromCachedMap() {
