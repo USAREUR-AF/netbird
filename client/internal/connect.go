@@ -439,6 +439,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			ClientMetrics:     c.clientMetrics,
 			MapCache:          mapStore,
 			Revocations:       revocationStoreFor(trustCfg, cachePath),
+			CertificatePath:   certificatePathFor(cachePath),
 			MapTrust:          trustCfg.Trust,
 			MapMaxAge:         trustCfg.MaxAge,
 			MapMaxAgeOverride: trustCfg.MaxAgeOverride,

@@ -97,6 +97,8 @@ type Server struct {
 	rootDocument *rootDocumentFile
 	// revocations is the revocation list sent with every sync response; nil when not configured.
 	revocations *revocationsFile
+	// membership issues membership certificates; nil when not configured.
+	membership *membershipIssuer
 }
 
 // NewServer creates a new Management server
@@ -166,7 +168,13 @@ func NewServer(
 		}
 	}
 
+	var membership *membershipIssuer
+	if ms := config.GoatMapSigning; ms != nil && ms.MembershipWindow.Duration > 0 {
+		membership = newMembershipIssuer(mapSigner, ms.MembershipWindow.Duration)
+	}
+
 	return &Server{
+		membership:               membership,
 		revocations:              revocations,
 		mapSigner:                mapSigner,
 		rootDocument:             rootDocument,
@@ -574,6 +582,14 @@ func (s *Server) goatSyncResponse(peerKey wgtypes.Key, resp *proto.SyncResponse)
 			if err := goatroot.Attach(out, doc); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if s.membership != nil && resp.GetNetworkMap() != nil {
+		if out == resp {
+			out = gproto.Clone(resp).(*proto.SyncResponse)
+		}
+		if err := s.membership.attach(peerKey.String(), resp.GetNetworkMap(), out); err != nil {
+			return nil, err
 		}
 	}
 	if s.revocations != nil {

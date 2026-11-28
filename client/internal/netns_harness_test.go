@@ -444,6 +444,7 @@ func TestNetns_RestartFromCachedMap(t *testing.T) {
 const (
 	extraTrustFile    = "trust_file"
 	extraRevStore     = "revocation_store"
+	extraCertStore    = "certificate_store"
 	statusRevs        = "revocations"
 	statusRevListings = "revoked_listings"
 )
@@ -462,6 +463,7 @@ func init() {
 			panic(err)
 		}
 		e.mapTrust, e.revStore = trust, store
+		e.member.path = s.Extra[extraCertStore]
 	})
 	helperStatusHooks = append(helperStatusHooks, func(e *Engine, extra map[string]any) {
 		if e.revStore != nil {
@@ -586,4 +588,134 @@ func readSigningKey(path string) (ed25519.PrivateKey, error) {
 		return nil, err
 	}
 	return k.(ed25519.PrivateKey), nil
+}
+
+const (
+	statusOwnCert = "own_certificate"
+	statusHeld    = "certificates_held"
+	statusRefused = "refused"
+)
+
+func init() {
+	helperStatusHooks = append(helperStatusHooks, func(e *Engine, extra map[string]any) {
+		e.syncMsgMux.Lock()
+		defer e.syncMsgMux.Unlock()
+		extra[statusOwnCert] = e.member.own != nil
+		extra[statusHeld] = len(e.member.held)
+		extra[statusRefused] = len(e.member.refused)
+	})
+}
+
+// TestNetns_MembershipCertificates: three peers in separate namespaces on a
+// management that signs maps and issues membership certificates with a 6 s
+// window, refreshed every 2 s.
+//
+//  1. All three connect and hold each other's certificates.
+//  2. Peer C loses management: A and B keep getting fresh certificates, C's
+//     freezes, and once they are more than the window apart A and B refuse C.
+//  3. C reaches management again: its fresh certificate reaches A and B with
+//     their next maps and they accept C again.
+//  4. All three lose management: their certificates freeze within one refresh
+//     of each other, so after three windows they still accept each other. The
+//     window is relative between peers, not against the clock.
+func TestNetns_MembershipCertificates(t *testing.T) {
+	netnsAvailable(t)
+	netnsTopology(t, 3)
+	dir := t.TempDir()
+
+	keyPath, signerPub := writeSigningKey(t, dir)
+	trustData, err := mapsign.MarshalTrustFile("goatnet-test", signerPub)
+	require.NoError(t, err)
+	trustPath := filepath.Join(dir, "map-trust.json")
+	require.NoError(t, os.WriteFile(trustPath, trustData, 0o644))
+	const window = 6 * time.Second
+
+	sigServer, signalAddr, err := startSignal(t)
+	require.NoError(t, err)
+	t.Cleanup(sigServer.Stop)
+	_, mgmtAddr, err := startManagementWithConfig(t, t.TempDir(), "../testdata/store.sql", func(c *config.Config) {
+		c.GoatMapSigning = &config.GoatMapSigning{GoatnetID: "goatnet-test", KeyFile: keyPath,
+			RefreshInterval: util.Duration{Duration: 2 * time.Second}, MembershipWindow: util.Duration{Duration: window}}
+	})
+	require.NoError(t, err)
+	signalGate := newTCPGateOn(t, netnsBridgeAddr+":0", signalAddr)
+
+	peers := make([]*netnsPeer, 3)
+	gates := make([]*tcpGate, 3)
+	for i := range peers {
+		gates[i] = newTCPGateOn(t, netnsBridgeAddr+":0", mgmtAddr)
+		peers[i] = newNetnsPeer(t, dir, i, gates[i].addr, signalGate.addr)
+		peers[i].settings.Extra = map[string]string{
+			extraTrustFile: trustPath,
+			extraRevStore:  filepath.Join(dir, fmt.Sprintf("peer%d.goat-revocations.json", i)),
+			extraCertStore: filepath.Join(dir, fmt.Sprintf("peer%d.goat-certificates.json", i)),
+		}
+		peers[i].start(t)
+	}
+	a, b, c := peers[0], peers[1], peers[2]
+	num := func(p *netnsPeer, k string) int {
+		v, _ := p.status().Extra[k].(float64)
+		return int(v)
+	}
+	allConnected := func() bool {
+		return a.status().Connected == 2 && b.status().Connected == 2 && c.status().Connected == 2
+	}
+
+	// 1.
+	waitFor(t, 120*time.Second, "all three connected, each holding two certificates", func() bool {
+		return allConnected() && num(a, statusHeld) == 2 && num(b, statusHeld) == 2 && num(c, statusHeld) == 2
+	})
+
+	// 2.
+	cutAt := time.Now()
+	gates[2].down()
+	waitFor(t, 4*window, "A and B to refuse C", func() bool {
+		_, aHasC := a.wg(c)
+		_, bHasC := b.wg(c)
+		return num(a, statusRefused) == 1 && num(b, statusRefused) == 1 && !aHasC && !bHasC
+	})
+	t.Logf("A and B refused C %s after C lost management (window %s)", time.Since(cutAt).Round(time.Second), window)
+	require.True(t, a.ping(b.overlayIP()), "A and B still reach each other")
+	require.False(t, a.ping(c.overlayIP()), "A no longer reaches C")
+
+	// 3.
+	backAt := time.Now()
+	gates[2].up(t)
+	waitFor(t, 90*time.Second, "A and B to accept C again and all three to connect", func() bool {
+		return num(a, statusRefused) == 0 && num(b, statusRefused) == 0 && allConnected()
+	})
+	t.Logf("C accepted again %s after it reached management", time.Since(backAt).Round(time.Second))
+	waitFor(t, 30*time.Second, "A reaches C again", func() bool { return a.ping(c.overlayIP()) })
+
+	// 4.
+	for _, g := range gates {
+		g.down()
+	}
+	islandAt := time.Now()
+	deadline := islandAt.Add(3 * window)
+	for time.Now().Before(deadline) {
+		require.Zero(t, num(a, statusRefused)+num(b, statusRefused)+num(c, statusRefused), "no peer refused on the island")
+		time.Sleep(time.Second)
+	}
+	require.True(t, a.ping(b.overlayIP()) && a.ping(c.overlayIP()) && b.ping(c.overlayIP()), "all three reach each other after three windows without management")
+	t.Logf("island of 3: 0 refusals and all pings answered %s (3 windows) after management became unreachable", time.Since(islandAt).Round(time.Second))
+
+	// 5. On the island, A restarts from its cached map. Its certificates come
+	// back from disk, so it checks them before management answers.
+	certPath := a.settings.Extra[extraCertStore]
+	fi, err := os.Stat(certPath)
+	require.NoError(t, err, "A keeps its certificates on disk")
+	require.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "the certificate file is owner-only")
+	a.stop(t)
+	restarted := time.Now()
+	a.settings.FromCache = true
+	a.start(t)
+	waitFor(t, 30*time.Second, "A to run from its cache holding its own and two peers' certificates from disk", func() bool {
+		s := a.status()
+		own, _ := s.Extra[statusOwnCert].(bool)
+		return s.Running && s.RunningFromCache && own && num(a, statusHeld) == 2
+	})
+	waitFor(t, 60*time.Second, "A reaches B and C again on the island", func() bool { return a.ping(b.overlayIP()) && a.ping(c.overlayIP()) })
+	require.Zero(t, num(a, statusRefused), "A refuses neither: the certificates from disk agree")
+	t.Logf("A restarted on the island with its certificates from disk and reached both peers %s later", time.Since(restarted).Round(time.Millisecond))
 }

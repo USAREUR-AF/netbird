@@ -157,11 +157,18 @@ func NewSignerFromFile(goatnetID, path string, refreshInterval time.Duration) (*
 // KeyID returns the signer's key identifier.
 func (s *Signer) KeyID() string { return s.keyID }
 
+// GoatnetID returns the goatnet the signer signs for.
+func (s *Signer) GoatnetID() string { return s.goatnetID }
+
 // PublicKey returns the signer's public key.
 func (s *Signer) PublicKey() ed25519.PublicKey {
 	pub, _ := s.key.Public().(ed25519.PublicKey)
 	return pub
 }
+
+// SignBytes signs msg with the signer's key. Other signed goatnet objects
+// (membership certificates) use it; msg must already carry its own domain string.
+func (s *Signer) SignBytes(msg []byte) []byte { return ed25519.Sign(s.key, msg) }
 
 // RefreshInterval is how often a connected peer's map is re-signed.
 func (s *Signer) RefreshInterval() time.Duration { return s.refreshInterval }
