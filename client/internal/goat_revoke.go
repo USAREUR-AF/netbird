@@ -3,6 +3,7 @@
 package internal
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -21,6 +22,18 @@ import (
 // Signed revocations, stored on disk and flooded once between peers
 // (USAREUR-AF/goatcore ADR 1273, phase 4). They need a trust set: a client
 // without one neither keeps nor forwards revocations.
+
+// peerMessage is what peers send each other on the revocation port.
+type peerMessage struct {
+	Kind string          `json:"kind"`
+	Body json.RawMessage `json:"body"`
+}
+
+const peerMessageRevocation = "revocation"
+
+// peerMessageHandlers handle the other kinds of peer message (later phases).
+// They run without syncMsgMux held.
+var peerMessageHandlers []func(e *Engine, msg peerMessage, from netip.Addr)
 
 // DefaultRevocationPort is the UDP port on each peer's overlay address that
 // receives revocations from other peers.
@@ -73,14 +86,25 @@ func (e *Engine) receiveRevocations(conn net.PacketConn) {
 		if err != nil {
 			return
 		}
-		r, err := goatrevoke.Parse(append([]byte(nil), buf[:n]...))
-		if err != nil {
+		var msg peerMessage
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
 			continue
 		}
 		fromIP, _ := netip.ParseAddrPort(from.String())
-		e.syncMsgMux.Lock()
-		e.acceptRevocation(r, fromIP.Addr())
-		e.syncMsgMux.Unlock()
+		switch msg.Kind {
+		case peerMessageRevocation:
+			r, err := goatrevoke.Parse(msg.Body)
+			if err != nil {
+				continue
+			}
+			e.syncMsgMux.Lock()
+			e.acceptRevocation(r, fromIP.Addr())
+			e.syncMsgMux.Unlock()
+		default:
+			for _, h := range peerMessageHandlers {
+				h(e, msg, fromIP.Addr())
+			}
+		}
 	}
 }
 
@@ -137,7 +161,11 @@ func (e *Engine) forwardRevocation(r *goatrevoke.Signed, from netip.Addr) {
 	if e.revConn == nil {
 		return
 	}
-	b, err := r.Marshal()
+	body, err := r.Marshal()
+	if err != nil {
+		return
+	}
+	b, err := json.Marshal(peerMessage{Kind: peerMessageRevocation, Body: body})
 	if err != nil || len(b) > goatrevoke.MaxMessageSize {
 		return
 	}
