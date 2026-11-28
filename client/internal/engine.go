@@ -65,6 +65,7 @@ import (
 	"github.com/netbirdio/netbird/route"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	"github.com/netbirdio/netbird/shared/management/domain"
+	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/netiputil"
 	auth "github.com/netbirdio/netbird/shared/relay/auth/hmac"
@@ -164,6 +165,12 @@ type EngineServices struct {
 	// MapCache, when set, receives every network map applied from management
 	// and the last direct endpoint of each peer. Nil disables the cache.
 	MapCache *mapcache.Store
+	// MapTrust, when set, is the set of signers whose network maps are accepted;
+	// an unsigned or wrongly signed map is refused. Nil accepts unsigned maps.
+	MapTrust *mapsign.TrustSet
+	// MapMaxAge bounds how long a verified map is trusted without a fresh one.
+	// Used only with MapTrust. Zero means mapcache.DefaultMaxAge.
+	MapMaxAge time.Duration
 }
 
 // Engine is a mechanism responsible for reacting on Signal and Management stream events and managing connections to the remote peers.
@@ -265,6 +272,16 @@ type Engine struct {
 	// cachedLazyExclude keeps peers taken from the cache out of lazy
 	// connection while runningFromCache. Protected by syncMsgMux.
 	cachedLazyExclude map[string]bool
+
+	mapTrust  *mapsign.TrustSet
+	mapMaxAge time.Duration
+	// mapAgeCheckInterval is how often a running engine checks the age of its last verified map.
+	mapAgeCheckInterval time.Duration
+	// lastVerifiedMap is when the last verified map was received. Protected by syncMsgMux.
+	lastVerifiedMap time.Time
+	// peersWithdrawnForAge is true while the remote peers are removed because the last
+	// verified map is older than mapMaxAge. Protected by syncMsgMux.
+	peersWithdrawnForAge bool
 }
 
 // Peer is an instance of the Connection Peer
@@ -308,7 +325,13 @@ func NewEngine(
 		clientMetrics:      services.ClientMetrics,
 		updateManager:      services.UpdateManager,
 		mapCache:           services.MapCache,
+		mapTrust:           services.MapTrust,
+		mapMaxAge:          services.MapMaxAge,
 	}
+	if engine.mapMaxAge <= 0 {
+		engine.mapMaxAge = mapcache.DefaultMaxAge
+	}
+	engine.mapAgeCheckInterval = time.Minute
 
 	log.Infof("I am: %s", config.WgPrivateKey.PublicKey().String())
 	return engine
@@ -588,12 +611,20 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
 	e.srWatcher.Start(peer.IsForceRelayed())
 
+	e.lastVerifiedMap = time.Now()
 	if e.cachedStart != nil {
 		if err := e.applyCachedMap(e.cachedStart); err != nil {
 			e.close()
 			return fmt.Errorf("apply cached network map: %w", err)
 		}
 		e.cachedStart = nil
+	}
+	if e.mapTrust != nil {
+		e.shutdownWg.Add(1)
+		go func() {
+			defer e.shutdownWg.Done()
+			e.runMapAgeCheck()
+		}()
 	}
 
 	e.receiveSignalEvents()
@@ -889,8 +920,15 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return e.ctx.Err()
 	}
 
-	if update.NetworkMap != nil && update.NetworkMap.PeerConfig != nil {
-		e.handleAutoUpdateVersion(update.NetworkMap.PeerConfig.AutoUpdate)
+	nm, signed, err := e.networkMapFromSync(update)
+	if err != nil {
+		log.Errorf("refusing the update from management: %v", err)
+		e.statusRecorder.PublishEvent(cProto.SystemEvent_ERROR, cProto.SystemEvent_SYSTEM, "Network map refused", err.Error(), nil)
+		return nil
+	}
+
+	if nm != nil && nm.PeerConfig != nil {
+		e.handleAutoUpdateVersion(nm.PeerConfig.AutoUpdate)
 	}
 
 	if update.GetNetbirdConfig() != nil {
@@ -931,7 +969,6 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return err
 	}
 
-	nm := update.GetNetworkMap()
 	if nm == nil {
 		return nil
 	}
@@ -951,6 +988,15 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		log.Debugf("sync response persisted with serial %d", nm.GetSerial())
 	}
 
+	if e.mapTrust != nil {
+		e.lastVerifiedMap = time.Now()
+		if e.peersWithdrawnForAge {
+			log.Infof("received a verified network map: restoring the remote peers")
+			e.peersWithdrawnForAge = false
+			e.networkSerial = 0
+		}
+	}
+
 	if e.runningFromCache {
 		// The first map from management replaces the cached one whatever its serial:
 		// a management whose serial was reset must not be ignored.
@@ -966,7 +1012,7 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 	}
 
 	e.mapCache.SetNetbirdConfig(update.GetNetbirdConfig())
-	if err := e.mapCache.SaveMap(nm); err != nil {
+	if err := e.mapCache.SaveMap(nm, signed); err != nil {
 		log.Warnf("failed to write the cached network map: %v", err)
 	}
 
@@ -991,6 +1037,73 @@ func (e *Engine) RunningFromCache() bool {
 	return e.runningFromCache
 }
 
+// networkMapFromSync returns the network map of a sync response and the signed
+// map it was read from. With a trust set, an unsigned, wrongly signed or too old
+// map is an error. Without one, a signed map is opened without verification.
+func (e *Engine) networkMapFromSync(update *mgmProto.SyncResponse) (*mgmProto.NetworkMap, *mapsign.SignedMap, error) {
+	signed, err := mapsign.FromSyncResponse(update)
+	if err != nil {
+		return nil, nil, err
+	}
+	if signed == nil {
+		if e.mapTrust != nil && update.GetNetworkMap() != nil {
+			return nil, nil, mapsign.ErrUnsigned
+		}
+		return update.GetNetworkMap(), nil, nil
+	}
+	if e.mapTrust == nil {
+		env, err := mapsign.Open(signed)
+		if err != nil {
+			return nil, nil, err
+		}
+		return env.Map(), signed, nil
+	}
+	env, err := e.mapTrust.Verify(e.config.WgPrivateKey.PublicKey().String(), signed)
+	if err != nil {
+		return nil, nil, err
+	}
+	if age := time.Since(env.IssuedAt()); age > e.mapMaxAge {
+		return nil, nil, fmt.Errorf("network map was signed %s ago, more than the maximum age %s", age.Round(time.Second), e.mapMaxAge)
+	}
+	return env.Map(), signed, nil
+}
+
+// runMapAgeCheck removes every remote peer when the last verified map is older
+// than the maximum age, and leaves them removed until a verified map arrives.
+func (e *Engine) runMapAgeCheck() {
+	ticker := time.NewTicker(e.mapAgeCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.enforceMapMaxAge()
+		}
+	}
+}
+
+func (e *Engine) enforceMapMaxAge() {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	if e.ctx.Err() != nil || e.peersWithdrawnForAge {
+		return
+	}
+	age := time.Since(e.lastVerifiedMap)
+	if age <= e.mapMaxAge {
+		return
+	}
+	msg := fmt.Sprintf("The last verified network map was received %s ago, more than the maximum age %s: remote peers removed until management sends a fresh map", age.Round(time.Second), e.mapMaxAge)
+	log.Warn(msg)
+	if err := e.removeAllPeers(); err != nil {
+		log.Errorf("failed to remove peers after the network map expired: %v", err)
+	}
+	e.statusRecorder.FinishPeerListModifications()
+	e.peersWithdrawnForAge = true
+	e.networkSerial = 0
+	e.statusRecorder.PublishEvent(cProto.SystemEvent_WARNING, cProto.SystemEvent_SYSTEM, "Network map expired", msg, nil)
+}
+
 // applyCachedMap applies a cached network map and points WireGuard at each
 // peer's last direct endpoint. The caller holds syncMsgMux.
 func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
@@ -1000,6 +1113,7 @@ func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
 	}
 	age, _ := entry.Age(mapcache.SystemClock)
 	endpoints := entry.DirectEndpoints()
+	e.lastVerifiedMap = time.Now().Add(-age)
 
 	e.runningFromCache = true
 	e.cachedLazyExclude = make(map[string]bool, len(endpoints))

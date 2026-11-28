@@ -61,6 +61,21 @@ type Config struct {
 	// EmbeddedIdP contains configuration for the embedded Dex OIDC provider.
 	// When set, Dex will be embedded in the management server and serve requests at /oauth2/
 	EmbeddedIdP *idp.EmbeddedIdPConfig
+
+	// GoatMapSigning, when set, makes management sign every network map it sends,
+	// and re-send each connected peer's map at RefreshInterval.
+	GoatMapSigning *GoatMapSigning
+}
+
+// GoatMapSigning names the goatnet and the Ed25519 key that sign network maps.
+type GoatMapSigning struct {
+	// GoatnetID is written into every signed map; clients refuse a map for another goatnet.
+	GoatnetID string
+	// KeyFile is a PKCS#8 PEM Ed25519 private key, readable by management only.
+	KeyFile string
+	// RefreshInterval is how often a connected peer's map is re-signed and re-sent.
+	// Zero means one hour.
+	RefreshInterval util.Duration
 }
 
 // GetAuthAudiences returns the audience from the http config and device authorization flow config

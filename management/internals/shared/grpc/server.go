@@ -45,6 +45,7 @@ import (
 	"github.com/netbirdio/netbird/management/server/settings"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/shared/management/mapsign"
 	"github.com/netbirdio/netbird/shared/management/proto"
 	internalStatus "github.com/netbirdio/netbird/shared/management/status"
 )
@@ -86,6 +87,9 @@ type Server struct {
 
 	reverseProxyManager rpservice.Manager
 	reverseProxyMu      sync.RWMutex
+
+	// mapSigner signs every network map sent to a peer; nil when map signing is not configured.
+	mapSigner *mapsign.Signer
 }
 
 // NewServer creates a new Management server
@@ -130,7 +134,18 @@ func NewServer(
 		}
 	}
 
+	var mapSigner *mapsign.Signer
+	if ms := config.GoatMapSigning; ms != nil {
+		var err error
+		mapSigner, err = mapsign.NewSignerFromFile(ms.GoatnetID, ms.KeyFile, ms.RefreshInterval.Duration)
+		if err != nil {
+			return nil, fmt.Errorf("network map signing: %w", err)
+		}
+		log.Infof("signing network maps for goatnet %s with key %s, refresh every %s", ms.GoatnetID, mapSigner.KeyID(), mapSigner.RefreshInterval())
+	}
+
 	return &Server{
+		mapSigner:                mapSigner,
 		jobManager:               jobManager,
 		accountManager:           accountManager,
 		settingsManager:          settingsManager,
@@ -422,8 +437,22 @@ func (s *Server) handleUpdates(ctx context.Context, accountID string, peerKey wg
 	debouncer := NewUpdateDebouncer(1000 * time.Millisecond)
 	defer debouncer.Stop()
 
+	// With map signing, a connected peer's map is re-signed and re-sent at the refresh
+	// interval even when nothing changed, so its signed issue time stays recent.
+	var refresh <-chan time.Time
+	if s.mapSigner != nil {
+		ticker := time.NewTicker(s.mapSigner.RefreshInterval())
+		defer ticker.Stop()
+		refresh = ticker.C
+	}
+
 	for {
 		select {
+		case <-refresh:
+			if err := s.networkMapController.UpdateAccountPeer(ctx, accountID, peer.ID); err != nil {
+				log.WithContext(ctx).Warnf("failed to refresh the signed network map of peer %s: %v", peerKey.String(), err)
+			}
+
 		// condition when there are some updates
 		// todo set the updates channel size to 1
 		case update, open := <-updates:
@@ -479,7 +508,14 @@ func (s *Server) sendUpdate(ctx context.Context, accountID string, peerKey wgtyp
 		return status.Errorf(codes.Internal, "failed processing update message")
 	}
 
-	encryptedResp, err := encryption.EncryptMessage(peerKey, key, update.Update)
+	resp, err := s.mapSigner.SignSyncResponse(peerKey.String(), update.Update)
+	if err != nil {
+		log.WithContext(ctx).Errorf("failed to sign the network map for peer %s: %v", peerKey.String(), err)
+		s.cancelPeerRoutines(ctx, accountID, peer, streamStartTime)
+		return status.Errorf(codes.Internal, "failed processing update message")
+	}
+
+	encryptedResp, err := encryption.EncryptMessage(peerKey, key, resp)
 	if err != nil {
 		s.cancelPeerRoutines(ctx, accountID, peer, streamStartTime)
 		return status.Errorf(codes.Internal, "failed processing update message")
@@ -939,7 +975,13 @@ func (s *Server) sendInitialSync(ctx context.Context, peerKey wgtypes.Key, peer 
 		return status.Errorf(codes.Internal, "failed getting server key")
 	}
 
-	encryptedResp, err := encryption.EncryptMessage(peerKey, key, plainResp)
+	signedResp, err := s.mapSigner.SignSyncResponse(peerKey.String(), plainResp)
+	if err != nil {
+		log.WithContext(ctx).Errorf("failed to sign the network map for peer %s: %v", peerKey.String(), err)
+		return status.Errorf(codes.Internal, "error handling request")
+	}
+
+	encryptedResp, err := encryption.EncryptMessage(peerKey, key, signedResp)
 	if err != nil {
 		return status.Errorf(codes.Internal, "error handling request")
 	}

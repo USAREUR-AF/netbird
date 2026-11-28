@@ -1598,6 +1598,12 @@ func startSignal(t *testing.T) (*grpc.Server, string, error) {
 
 func startManagement(t *testing.T, dataDir, testFile string) (*grpc.Server, string, error) {
 	t.Helper()
+	return startManagementWithConfig(t, dataDir, testFile, nil)
+}
+
+// startManagementWithConfig starts a management server whose config is changed by edit before use.
+func startManagementWithConfig(t *testing.T, dataDir, testFile string, edit func(*config.Config)) (*grpc.Server, string, error) {
+	t.Helper()
 
 	config := &config.Config{
 		Stuns:      []*config.Host{},
@@ -1613,6 +1619,9 @@ func startManagement(t *testing.T, dataDir, testFile string) (*grpc.Server, stri
 		},
 		Datadir:    dataDir,
 		HttpConfig: nil,
+	}
+	if edit != nil {
+		edit(config)
 	}
 
 	lis, err := net.Listen("tcp", "localhost:0")
