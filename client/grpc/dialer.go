@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"runtime"
 	"time"
 
@@ -17,6 +18,13 @@ import (
 
 	"github.com/netbirdio/netbird/util/embeddedroots"
 )
+
+// ExtraRootCAsPEM holds PEM-encoded root certificates that a program embedding
+// this client trusts in addition to the system roots when it dials the
+// management and signal servers. It is empty by default. Set it before the
+// first dial, for example to a private CA whose root the operating system's
+// trust store cannot import (macOS refuses Ed25519 roots).
+var ExtraRootCAsPEM []byte
 
 // Backoff returns a backoff configuration for gRPC calls
 func Backoff(ctx context.Context) backoff.BackOff {
@@ -32,7 +40,7 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
 	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	opts := append(dialOptions(tlsEnabled, component), grpc.WithBlock())
+	opts := append(dialOptions(addr, tlsEnabled, component), grpc.WithBlock())
 	opts = append(opts, extraOpts...)
 
 	conn, err := grpc.DialContext(connCtx, addr, opts...)
@@ -47,7 +55,7 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
 // The connection is made in the background and re-made after failures, so the caller can
 // start while the server is unreachable. Used when the client starts from a cached network map.
 func CreateConnectionLazy(ctx context.Context, addr string, tlsEnabled bool, component string, extraOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	opts := append(dialOptions(tlsEnabled, component), extraOpts...)
+	opts := append(dialOptions(addr, tlsEnabled, component), extraOpts...)
 
 	conn, err := grpc.DialContext(ctx, addr, opts...)
 	if err != nil {
@@ -57,7 +65,7 @@ func CreateConnectionLazy(ctx context.Context, addr string, tlsEnabled bool, com
 	return conn, nil
 }
 
-func dialOptions(tlsEnabled bool, component string) []grpc.DialOption {
+func dialOptions(addr string, tlsEnabled bool, component string) []grpc.DialOption {
 	transportOption := grpc.WithTransportCredentials(insecure.NewCredentials())
 	// for js, the outer websocket layer takes care of tls
 	if tlsEnabled && runtime.GOOS != "js" {
@@ -67,8 +75,21 @@ func dialOptions(tlsEnabled bool, component string) []grpc.DialOption {
 			certPool = embeddedroots.Get()
 		}
 
+		if len(ExtraRootCAsPEM) > 0 {
+			if ok := certPool.AppendCertsFromPEM(ExtraRootCAsPEM); !ok {
+				log.Warn("ExtraRootCAsPEM holds no parseable certificate; dialing with the system roots only")
+			}
+		}
+
+		// gRPC passes "host:port" as the name to verify, which never matches an
+		// IP address in a certificate's SAN. Verify against the host alone.
+		serverName := addr
+		if h, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
+			serverName = h
+		}
 		transportOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			RootCAs: certPool,
+			RootCAs:    certPool,
+			ServerName: serverName,
 		}))
 	}
 
