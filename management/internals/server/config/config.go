@@ -76,6 +76,9 @@ type GoatMapSigning struct {
 	// RefreshInterval is how often a connected peer's map is re-signed and re-sent.
 	// Zero means one hour.
 	RefreshInterval util.Duration
+	// RootDocumentFile, when set, is the goatnet root document (goatroot.Signed) sent
+	// with every sync response. It is read again when the file changes.
+	RootDocumentFile string
 }
 
 // GetAuthAudiences returns the audience from the http config and device authorization flow config

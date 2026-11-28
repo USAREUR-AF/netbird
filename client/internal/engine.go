@@ -65,6 +65,7 @@ import (
 	"github.com/netbirdio/netbird/route"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	"github.com/netbirdio/netbird/shared/management/domain"
+	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/netiputil"
@@ -171,6 +172,14 @@ type EngineServices struct {
 	// MapMaxAge bounds how long a verified map is trusted without a fresh one.
 	// Used only with MapTrust. Zero means mapcache.DefaultMaxAge.
 	MapMaxAge time.Duration
+	// MapMaxAgeOverride is a maximum age declared on the client, which may only
+	// shorten the root document's. Zero when none is declared.
+	MapMaxAgeOverride time.Duration
+	// RootDocument is the held goatnet root document; when set, MapTrust and
+	// MapMaxAge follow it and a newer version from management replaces it.
+	RootDocument *goatroot.Signed
+	// RootDocumentPath is where a newer root document is written.
+	RootDocumentPath string
 }
 
 // Engine is a mechanism responsible for reacting on Signal and Management stream events and managing connections to the remote peers.
@@ -282,6 +291,11 @@ type Engine struct {
 	// peersWithdrawnForAge is true while the remote peers are removed because the last
 	// verified map is older than mapMaxAge. Protected by syncMsgMux.
 	peersWithdrawnForAge bool
+
+	// rootDoc is the held goatnet root document. Protected by syncMsgMux.
+	rootDoc           *goatroot.Signed
+	rootDocPath       string
+	mapMaxAgeOverride time.Duration
 }
 
 // Peer is an instance of the Connection Peer
@@ -327,6 +341,9 @@ func NewEngine(
 		mapCache:           services.MapCache,
 		mapTrust:           services.MapTrust,
 		mapMaxAge:          services.MapMaxAge,
+		mapMaxAgeOverride:  services.MapMaxAgeOverride,
+		rootDoc:            services.RootDocument,
+		rootDocPath:        services.RootDocumentPath,
 	}
 	if engine.mapMaxAge <= 0 {
 		engine.mapMaxAge = mapcache.DefaultMaxAge
@@ -920,6 +937,9 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return e.ctx.Err()
 	}
 
+	// A newer root document is applied first, so a map from a signer it adds verifies in the same update.
+	e.applyRootDocument(update)
+
 	nm, signed, err := e.networkMapFromSync(update)
 	if err != nil {
 		log.Errorf("refusing the update from management: %v", err)
@@ -1011,10 +1031,7 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		return err
 	}
 
-	e.mapCache.SetNetbirdConfig(update.GetNetbirdConfig())
-	if err := e.mapCache.SaveMap(nm, signed); err != nil {
-		log.Warnf("failed to write the cached network map: %v", err)
-	}
+	e.persistMap(update, nm, signed)
 
 	e.statusRecorder.PublishEvent(cProto.SystemEvent_INFO, cProto.SystemEvent_SYSTEM, "Network map updated", "", nil)
 
@@ -1035,6 +1052,16 @@ func (e *Engine) RunningFromCache() bool {
 	e.syncMsgMux.Lock()
 	defer e.syncMsgMux.Unlock()
 	return e.runningFromCache
+}
+
+// EffectiveMapMaxAge returns the root document's maximum age, shortened by a
+// client override when one is declared and shorter.
+func EffectiveMapMaxAge(doc *goatroot.Document, override time.Duration) time.Duration {
+	maxAge := doc.MapMaxAge()
+	if override > 0 && override < maxAge {
+		return override
+	}
+	return maxAge
 }
 
 // networkMapFromSync returns the network map of a sync response and the signed
@@ -1868,8 +1895,8 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 		return nil, err
 	}
 
-	if e.mapCache != nil {
-		peerConn.SetOnDirectEndpoint(e.mapCache.SetEndpoint)
+	if hook := e.directEndpointHook(); hook != nil {
+		peerConn.SetOnDirectEndpoint(hook)
 	}
 
 	if e.rpManager != nil {

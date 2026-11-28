@@ -40,7 +40,6 @@ import (
 	sshconfig "github.com/netbirdio/netbird/client/ssh/config"
 	"github.com/netbirdio/netbird/client/system"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
-	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
@@ -260,19 +259,15 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		var cached *mapcache.Entry
 
 		// A declared trust file makes every network map, fresh or cached, require a valid signature.
-		mapTrust, err := mapcache.TrustFromEnv()
+		trustCfg, err := loadTrustConfig()
 		if err != nil {
 			return wrapErr(gstatus.Errorf(codes.FailedPrecondition, "network map trust: %s", err))
-		}
-		mapMaxAge, maxAgeErr := mapcache.MaxAgeFromEnv()
-		if maxAgeErr != nil {
-			mapMaxAge = mapcache.DefaultMaxAge
 		}
 
 		log.Debugf("connecting to the Management service %s", c.config.ManagementURL.Host)
 		mgmClient, err := mgm.NewClient(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
 		if err != nil {
-			cached = usableCachedMap(cachePath, cacheBinding, mapTrust)
+			cached = usableCachedMap(cachePath, cacheBinding, trustCfg)
 			if cached == nil {
 				return wrapErr(gstatus.Errorf(codes.FailedPrecondition, "failed connecting to Management Service : %s", err))
 			}
@@ -319,7 +314,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 					_ = c.Stop()
 					return backoff.Permanent(wrapErr(err)) // unrecoverable error
 				}
-				cached = usableCachedMap(cachePath, cacheBinding, mapTrust)
+				cached = usableCachedMap(cachePath, cacheBinding, trustCfg)
 				if cached == nil {
 					return wrapErr(err)
 				}
@@ -416,7 +411,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 
 		var mapStore *mapcache.Store
 		if !mapcache.Disabled() && cachePath != "" {
-			mapStore = mapcache.NewStore(cachePath, cacheBinding, nil)
+			mapStore = newMapStore(cachePath, cacheBinding)
 			if cached != nil {
 				mapStore.Seed(cached)
 			} else {
@@ -426,17 +421,20 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 
 		c.engineMutex.Lock()
 		engine := NewEngine(engineCtx, cancel, engineConfig, EngineServices{
-			SignalClient:   signalClient,
-			MgmClient:      mgmClient,
-			RelayManager:   relayManager,
-			StatusRecorder: c.statusRecorder,
-			Checks:         checks,
-			StateManager:   stateManager,
-			UpdateManager:  c.updateManager,
-			ClientMetrics:  c.clientMetrics,
-			MapCache:       mapStore,
-			MapTrust:       mapTrust,
-			MapMaxAge:      mapMaxAge,
+			SignalClient:      signalClient,
+			MgmClient:         mgmClient,
+			RelayManager:      relayManager,
+			StatusRecorder:    c.statusRecorder,
+			Checks:            checks,
+			StateManager:      stateManager,
+			UpdateManager:     c.updateManager,
+			ClientMetrics:     c.clientMetrics,
+			MapCache:          mapStore,
+			MapTrust:          trustCfg.Trust,
+			MapMaxAge:         trustCfg.MaxAge,
+			MapMaxAgeOverride: trustCfg.MaxAgeOverride,
+			RootDocument:      trustCfg.Root,
+			RootDocumentPath:  trustCfg.RootPath,
 		}, mobileDependency)
 		engine.SetSyncResponsePersistence(c.persistSyncResponse)
 		if cached != nil {
@@ -705,48 +703,6 @@ func connectToSignal(ctx context.Context, wtConfig *mgmProto.NetbirdConfig, ourP
 	}
 
 	return signalClient, nil
-}
-
-// usableCachedMap returns the cached network map at path when it may be used for b,
-// or nil with the reason logged.
-func usableCachedMap(path string, b mapcache.Binding, trust *mapsign.TrustSet) *mapcache.Entry {
-	if path == "" || mapcache.Disabled() {
-		return nil
-	}
-	maxAge, err := mapcache.MaxAgeFromEnv()
-	if err != nil {
-		log.Errorf("not using the cached network map: %v", err)
-		return nil
-	}
-	entry, err := mapcache.LoadUsable(path, b, maxAge, mapcache.SystemClock, trust)
-	if err != nil {
-		if !errors.Is(err, mapcache.ErrNotFound) {
-			log.Warnf("not using the cached network map %s: %v", path, err)
-		}
-		return nil
-	}
-	return entry
-}
-
-// HasUsableCachedMap reports whether a client with config could start from its
-// cached network map now. statePath is the client's state file.
-func HasUsableCachedMap(config *profilemanager.Config, statePath string) bool {
-	if config == nil || config.ManagementURL == nil {
-		return false
-	}
-	key, err := wgtypes.ParseKey(config.PrivateKey)
-	if err != nil {
-		return false
-	}
-	trust, err := mapcache.TrustFromEnv()
-	if err != nil {
-		log.Errorf("not using the cached network map: %v", err)
-		return false
-	}
-	return usableCachedMap(mapcache.PathForState(statePath), mapcache.Binding{
-		ManagementURL: config.ManagementURL.String(),
-		PeerKey:       key.PublicKey().String(),
-	}, trust) != nil
 }
 
 // loginToManagement creates Management ServiceDependencies client, establishes a connection, logs-in and gets a global Netbird config (signal, turn, stun hosts, etc)

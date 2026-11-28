@@ -24,6 +24,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
@@ -48,6 +49,10 @@ const (
 	// EnvTrustFile names a map trust file (see mapsign.LoadTrustFile). When set,
 	// every network map, fresh or cached, must be signed by a signer it lists.
 	EnvTrustFile = "NB_MAP_TRUST_FILE"
+	// EnvRootFile names the held goatnet root document (see goatroot). When set
+	// it takes the place of EnvTrustFile, and newer versions from management
+	// are written to it.
+	EnvRootFile = "NB_GOATNET_ROOT_FILE"
 
 	fileSuffix = ".goat-map.json"
 )
@@ -243,13 +248,65 @@ func ParseMaxAge(v string) (time.Duration, error) {
 	return d, nil
 }
 
-// TrustFromEnv loads the declared map trust file. It returns nil, nil when none is declared.
-func TrustFromEnv() (*mapsign.TrustSet, error) {
-	path := strings.TrimSpace(os.Getenv(EnvTrustFile))
-	if path == "" {
-		return nil, nil //nolint:nilnil // no trust file declared: unsigned maps are accepted
+// TrustConfig is how a client checks network maps.
+type TrustConfig struct {
+	// Trust is the set of accepted map signers; nil accepts unsigned maps.
+	Trust *mapsign.TrustSet
+	// MaxAge is the effective maximum age of a map.
+	MaxAge time.Duration
+	// MaxAgeOverride is the maximum age declared on the client, zero when none is.
+	MaxAgeOverride time.Duration
+	// MaxAgeInvalid is true when the declared maximum age could not be used;
+	// the cache is then not started from.
+	MaxAgeInvalid bool
+	// Root is the held goatnet root document, nil when none is declared.
+	Root *goatroot.Signed
+	// RootPath is where the root document is held.
+	RootPath string
+}
+
+// TrustConfigFromEnv reads the client's declarations: NB_GOATNET_ROOT_FILE (the
+// held root document, which names the map signers and the maximum age),
+// otherwise NB_MAP_TRUST_FILE (a list of signers), and NB_MAP_CACHE_MAX_AGE,
+// which may only shorten the root document's maximum age.
+func TrustConfigFromEnv() (*TrustConfig, error) {
+	cfg := &TrustConfig{MaxAge: DefaultMaxAge}
+	if v := strings.TrimSpace(os.Getenv(EnvMaxAge)); v != "" {
+		d, err := ParseMaxAge(v)
+		if err != nil {
+			log.Errorf("ignoring the declared maximum map age: %v", err)
+			cfg.MaxAgeInvalid = true
+		} else {
+			cfg.MaxAgeOverride = d
+			cfg.MaxAge = d
+		}
 	}
-	return mapsign.LoadTrustFile(path)
+
+	if path := strings.TrimSpace(os.Getenv(EnvRootFile)); path != "" {
+		root, err := goatroot.Load(path)
+		if err != nil {
+			return nil, err
+		}
+		trust, err := root.Doc().TrustSet()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Root, cfg.RootPath, cfg.Trust = root, path, trust
+		cfg.MaxAge = root.Doc().MapMaxAge()
+		if cfg.MaxAgeOverride > 0 && cfg.MaxAgeOverride < cfg.MaxAge {
+			cfg.MaxAge = cfg.MaxAgeOverride
+		}
+		return cfg, nil
+	}
+
+	if path := strings.TrimSpace(os.Getenv(EnvTrustFile)); path != "" {
+		trust, err := mapsign.LoadTrustFile(path)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Trust = trust
+	}
+	return cfg, nil
 }
 
 // Disabled reports whether the cache is turned off.

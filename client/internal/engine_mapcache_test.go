@@ -29,6 +29,7 @@ import (
 	"github.com/netbirdio/netbird/client/system"
 	"github.com/netbirdio/netbird/management/internals/server/config"
 	mgmt "github.com/netbirdio/netbird/shared/management/client"
+	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
@@ -128,6 +129,8 @@ type cacheTestPeer struct {
 	trust    *mapsign.TrustSet
 	maxAge   time.Duration
 	ageCheck time.Duration
+	root     *goatroot.Signed
+	rootPath string
 }
 
 func (p *cacheTestPeer) ifaceName() string {
@@ -173,13 +176,15 @@ func (p *cacheTestPeer) start(t *testing.T, parent context.Context, mgmtAddr, si
 	}
 	relayMgr := relayClient.NewManager(ctx, nil, p.key.PublicKey().String(), iface.DefaultMTU)
 	e := NewEngine(ctx, cancel, conf, EngineServices{
-		SignalClient:   signalClient,
-		MgmClient:      mgmClient,
-		RelayManager:   relayMgr,
-		StatusRecorder: peer.NewRecorder("https://mgm"),
-		MapCache:       store,
-		MapTrust:       p.trust,
-		MapMaxAge:      p.maxAge,
+		SignalClient:     signalClient,
+		MgmClient:        mgmClient,
+		RelayManager:     relayMgr,
+		StatusRecorder:   peer.NewRecorder("https://mgm"),
+		MapCache:         store,
+		MapTrust:         p.trust,
+		MapMaxAge:        p.maxAge,
+		RootDocument:     p.root,
+		RootDocumentPath: p.rootPath,
 	}, MobileDependency{})
 	if p.ageCheck > 0 {
 		e.mapAgeCheckInterval = p.ageCheck
@@ -367,14 +372,14 @@ func TestUsableCachedMap(t *testing.T) {
 		t.Setenv(mapcache.EnvMaxAge, "2h")
 		path := filepath.Join(t.TempDir(), "state.goat-map.json")
 		writeAged(t, path, time.Hour)
-		assert.NotNil(t, usableCachedMap(path, binding, nil))
+		assert.NotNil(t, usableCachedMap(path, binding, envTrustConfig(t)))
 	})
 
 	t.Run("older than the bound is refused and deleted", func(t *testing.T) {
 		t.Setenv(mapcache.EnvMaxAge, "1h")
 		path := filepath.Join(t.TempDir(), "state.goat-map.json")
 		writeAged(t, path, 2*time.Hour)
-		assert.Nil(t, usableCachedMap(path, binding, nil))
+		assert.Nil(t, usableCachedMap(path, binding, envTrustConfig(t)))
 		_, err := os.Stat(path)
 		assert.True(t, errors.Is(err, os.ErrNotExist))
 	})
@@ -384,7 +389,7 @@ func TestUsableCachedMap(t *testing.T) {
 		writeAged(t, path, time.Minute)
 		other := binding
 		other.ManagementURL = "https://other.example:443"
-		assert.Nil(t, usableCachedMap(path, other, nil))
+		assert.Nil(t, usableCachedMap(path, other, envTrustConfig(t)))
 	})
 
 	t.Run("another peer key is refused", func(t *testing.T) {
@@ -392,21 +397,21 @@ func TestUsableCachedMap(t *testing.T) {
 		writeAged(t, path, time.Minute)
 		other := binding
 		other.PeerKey = "other"
-		assert.Nil(t, usableCachedMap(path, other, nil))
+		assert.Nil(t, usableCachedMap(path, other, envTrustConfig(t)))
 	})
 
 	t.Run("an invalid bound refuses every cache", func(t *testing.T) {
 		t.Setenv(mapcache.EnvMaxAge, "10m")
 		path := filepath.Join(t.TempDir(), "state.goat-map.json")
 		writeAged(t, path, time.Second)
-		assert.Nil(t, usableCachedMap(path, binding, nil))
+		assert.Nil(t, usableCachedMap(path, binding, envTrustConfig(t)))
 	})
 
 	t.Run("disabled", func(t *testing.T) {
 		t.Setenv(mapcache.EnvDisable, "true")
 		path := filepath.Join(t.TempDir(), "state.goat-map.json")
 		writeAged(t, path, time.Second)
-		assert.Nil(t, usableCachedMap(path, binding, nil))
+		assert.Nil(t, usableCachedMap(path, binding, envTrustConfig(t)))
 	})
 }
 
@@ -629,4 +634,224 @@ func TestEngine_NetworkMapFromSync(t *testing.T) {
 	got, _, err = open.networkMapFromSync(&mgmProto.SyncResponse{NetworkMap: nm})
 	require.NoError(t, err, "without a trust set an unsigned map is accepted")
 	assert.Equal(t, uint64(3), got.GetSerial())
+}
+
+func envTrustConfig(t *testing.T) *mapcache.TrustConfig {
+	t.Helper()
+	cfg, err := mapcache.TrustConfigFromEnv()
+	require.NoError(t, err)
+	return cfg
+}
+
+func rootDoc(t *testing.T, version uint64, root ed25519.PrivateKey, maxAge time.Duration, signers ...ed25519.PublicKey) *goatroot.Document {
+	t.Helper()
+	d := &goatroot.Document{
+		Format:           goatroot.FormatVersion,
+		GoatnetID:        "goatnet-test",
+		Version:          version,
+		RootKeys:         []goatroot.Key{goatroot.NewKey(root.Public().(ed25519.PublicKey))},
+		MapMaxAgeSeconds: int64(maxAge / time.Second),
+	}
+	for _, k := range signers {
+		d.MapSigners = append(d.MapSigners, goatroot.NewKey(k))
+	}
+	return d
+}
+
+func signRoot(t *testing.T, d *goatroot.Document, keys ...ed25519.PrivateKey) *goatroot.Signed {
+	t.Helper()
+	s, err := goatroot.Sign(d, keys...)
+	require.NoError(t, err)
+	return s
+}
+
+// TestEngine_ApplyRootDocument covers a client holding a root document: a newer
+// version from management replaces it on disk and in the engine, adding and
+// removing map signers; an older, foreign or wrongly signed version is ignored.
+func TestEngine_ApplyRootDocument(t *testing.T) {
+	wgKey, err := wgtypes.GeneratePrivateKey()
+	require.NoError(t, err)
+	peerKey := wgKey.PublicKey().String()
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	_, siteA, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	_, siteB, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pubA, pubB := siteA.Public().(ed25519.PublicKey), siteB.Public().(ed25519.PublicKey)
+
+	v1 := signRoot(t, rootDoc(t, 1, root, 72*time.Hour, pubA), root)
+	path := filepath.Join(t.TempDir(), "goatnet-root.json")
+	require.NoError(t, goatroot.Store(path, v1))
+	t.Setenv(mapcache.EnvRootFile, path)
+	t.Setenv(mapcache.EnvMaxAge, "")
+	cfg, err := mapcache.TrustConfigFromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, 72*time.Hour, cfg.MaxAge)
+
+	e := &Engine{
+		config:         &EngineConfig{WgPrivateKey: wgKey},
+		statusRecorder: peer.NewRecorder("https://mgm"),
+		mapTrust:       cfg.Trust,
+		mapMaxAge:      cfg.MaxAge,
+		rootDoc:        cfg.Root,
+		rootDocPath:    cfg.RootPath,
+	}
+	signerA, err := mapsign.NewSigner("goatnet-test", siteA, time.Hour)
+	require.NoError(t, err)
+	signerB, err := mapsign.NewSigner("goatnet-test", siteB, time.Hour)
+	require.NoError(t, err)
+	update := func(signer *mapsign.Signer, doc *goatroot.Signed) *mgmProto.SyncResponse {
+		resp, err := signer.SignSyncResponse(peerKey, &mgmProto.SyncResponse{NetworkMap: &mgmProto.NetworkMap{Serial: 1}})
+		require.NoError(t, err)
+		if doc != nil {
+			require.NoError(t, goatroot.Attach(resp, doc))
+		}
+		return resp
+	}
+	accepts := func(resp *mgmProto.SyncResponse) error {
+		e.applyRootDocument(resp)
+		_, _, err := e.networkMapFromSync(resp)
+		return err
+	}
+
+	assert.ErrorIs(t, accepts(update(signerB, nil)), mapsign.ErrUnknownKey, "site B is not a signer in version 1")
+
+	v2 := signRoot(t, rootDoc(t, 2, root, 24*time.Hour, pubA, pubB), root)
+	require.NoError(t, accepts(update(signerB, v2)), "version 2 adds site B in the same update")
+	assert.Equal(t, uint64(2), e.rootDoc.Doc().Version)
+	assert.Equal(t, 24*time.Hour, e.mapMaxAge, "the maximum age follows the root document")
+	onDisk, err := goatroot.Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), onDisk.Doc().Version, "version 2 is written to the held file")
+
+	stale := signRoot(t, rootDoc(t, 1, root, 72*time.Hour, pubA), root)
+	e.applyRootDocument(update(signerA, stale))
+	assert.Equal(t, uint64(2), e.rootDoc.Doc().Version, "an older version is ignored")
+
+	_, intruder, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	forged := signRoot(t, rootDoc(t, 9, intruder, 720*time.Hour, intruder.Public().(ed25519.PublicKey)), intruder)
+	e.applyRootDocument(update(signerA, forged))
+	assert.Equal(t, uint64(2), e.rootDoc.Doc().Version, "a version not signed by a held root key is ignored")
+
+	// Version 3 severs site A: its maps are refused from then on.
+	v3 := signRoot(t, rootDoc(t, 3, root, 24*time.Hour, pubB), root)
+	assert.ErrorIs(t, accepts(update(signerA, v3)), mapsign.ErrUnknownKey, "site A's map is refused once version 3 removes it")
+	require.NoError(t, accepts(update(signerB, nil)))
+
+	// A client-declared maximum age only shortens the document's.
+	e.mapMaxAgeOverride = 2 * time.Hour
+	assert.Equal(t, 2*time.Hour, EffectiveMapMaxAge(v3.Doc(), e.mapMaxAgeOverride))
+	assert.Equal(t, 24*time.Hour, EffectiveMapMaxAge(v3.Doc(), 48*time.Hour))
+}
+
+func heldRootVersion(e *Engine) uint64 {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	return e.rootDoc.Doc().Version
+}
+
+func lastVerifiedMap(e *Engine) time.Time {
+	e.syncMsgMux.Lock()
+	defer e.syncMsgMux.Unlock()
+	return e.lastVerifiedMap
+}
+
+// TestEngine_RootDocument runs two peers that hold version 1 of a goatnet root
+// document against a management that signs with site A's key and serves the
+// root document from a file. Version 2 (adding site B) reaches both peers and
+// is written to their held files. Version 3 removes site A: the peers take it
+// and from then on refuse site A's maps, so their last verified map stops
+// advancing while management keeps sending maps.
+func TestEngine_RootDocument(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("needs Linux WireGuard interfaces")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to create WireGuard interfaces")
+	}
+
+	ctx, cancel := context.WithCancel(CtxInitState(context.Background()))
+	defer cancel()
+
+	dir := t.TempDir()
+	keyPath, pubA := writeSigningKey(t, dir)
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pubB, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	v1 := signRoot(t, rootDoc(t, 1, root, 72*time.Hour, pubA), root)
+	v2 := signRoot(t, rootDoc(t, 2, root, 72*time.Hour, pubA, pubB), root)
+	v3 := signRoot(t, rootDoc(t, 3, root, 72*time.Hour, pubB), root)
+	served := filepath.Join(dir, "served-root.json")
+	require.NoError(t, goatroot.Store(served, v2))
+
+	const refresh = 2 * time.Second
+	sigServer, signalAddr, err := startSignal(t)
+	require.NoError(t, err)
+	defer sigServer.Stop()
+	mgmtServer, mgmtAddr, err := startManagementWithConfig(t, t.TempDir(), "../testdata/store.sql", func(c *config.Config) {
+		c.GoatMapSigning = &config.GoatMapSigning{GoatnetID: "goatnet-test", KeyFile: keyPath, RefreshInterval: util.Duration{Duration: refresh}, RootDocumentFile: served}
+	})
+	require.NoError(t, err)
+	defer mgmtServer.GracefulStop()
+
+	setupKey := "A2C8E62B-38F5-4553-B31E-DD66C696CEBB"
+	peers := make([]*cacheTestPeer, 2)
+	for i := range peers {
+		key, err := wgtypes.GeneratePrivateKey()
+		require.NoError(t, err)
+		reg, err := mgmt.NewClient(ctx, mgmtAddr, key, false)
+		require.NoError(t, err)
+		resp, err := reg.Register(setupKey, "", system.GetInfo(ctx), nil, nil)
+		require.NoError(t, err)
+		_ = reg.Close()
+
+		rootPath := filepath.Join(dir, fmt.Sprintf("peer%d-root.json", i))
+		require.NoError(t, goatroot.Store(rootPath, v1))
+		held, err := goatroot.Load(rootPath)
+		require.NoError(t, err)
+		trust, err := held.Doc().TrustSet()
+		require.NoError(t, err)
+		peers[i] = &cacheTestPeer{
+			key:       key,
+			index:     20 + i,
+			address:   resp.GetPeerConfig().GetAddress(),
+			cachePath: filepath.Join(dir, fmt.Sprintf("peer%d.goat-map.json", i)),
+			binding:   mapcache.Binding{ManagementURL: "http://" + mgmtAddr, PeerKey: key.PublicKey().String()},
+			trust:     trust,
+			root:      held,
+			rootPath:  rootPath,
+		}
+		peers[i].start(t, ctx, mgmtAddr, signalAddr, nil)
+	}
+	defer peers[0].stop(t)
+	defer peers[1].stop(t)
+
+	// 1. Version 2 reaches both peers, is written to their held files, and the peers connect.
+	waitFor(t, 60*time.Second, "both peers to hold root document version 2 and connect", func() bool {
+		return heldRootVersion(peers[0].engine) == 2 && heldRootVersion(peers[1].engine) == 2 &&
+			getConnectedPeers(peers[0].engine) == 1 && getConnectedPeers(peers[1].engine) == 1
+	})
+	for i, p := range peers {
+		onDisk, err := goatroot.Load(p.rootPath)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(2), onDisk.Doc().Version, "peer %d wrote version 2", i)
+	}
+
+	// 2. Management serves version 3, which removes site A, the key it signs with.
+	require.NoError(t, goatroot.Store(served, v3))
+	waitFor(t, 30*time.Second, "both peers to hold root document version 3", func() bool {
+		return heldRootVersion(peers[0].engine) == 3 && heldRootVersion(peers[1].engine) == 3
+	})
+	severedAt := []time.Time{lastVerifiedMap(peers[0].engine), lastVerifiedMap(peers[1].engine)}
+
+	// 3. Over three refresh intervals management keeps sending site A's maps; neither peer verifies one.
+	time.Sleep(3*refresh + refresh/2)
+	for i, p := range peers {
+		assert.Equal(t, severedAt[i], lastVerifiedMap(p.engine), "peer %d verified no map signed by the removed site", i)
+	}
+	t.Logf("root document versions 1 -> 2 -> 3 applied on 2 of 2 peers; 0 maps from the removed signer verified over %s", 3*refresh+refresh/2)
 }

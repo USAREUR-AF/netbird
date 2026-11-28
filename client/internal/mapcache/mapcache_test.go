@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/netbird/shared/management/goatroot"
 	"github.com/netbirdio/netbird/shared/management/mapsign"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
@@ -405,5 +406,63 @@ func TestSignedCacheVerifiesAtLoad(t *testing.T) {
 		require.NoError(t, write(path, e))
 		_, err = LoadUsable(path, testBinding, time.Hour, later, trust)
 		assert.ErrorIs(t, err, ErrTooOld)
+	})
+}
+
+func TestTrustConfigFromEnv(t *testing.T) {
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signerPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	doc := &goatroot.Document{
+		Format: goatroot.FormatVersion, GoatnetID: "goatnet-1", Version: 1, MapMaxAgeSeconds: int64((24 * time.Hour).Seconds()),
+		RootKeys:   []goatroot.Key{goatroot.NewKey(root.Public().(ed25519.PublicKey))},
+		MapSigners: []goatroot.Key{goatroot.NewKey(signerPub)},
+	}
+	signed, err := goatroot.Sign(doc, root)
+	require.NoError(t, err)
+	rootPath := filepath.Join(t.TempDir(), "goatnet-root.json")
+	require.NoError(t, goatroot.Store(rootPath, signed))
+
+	t.Run("nothing declared", func(t *testing.T) {
+		t.Setenv(EnvRootFile, "")
+		t.Setenv(EnvTrustFile, "")
+		t.Setenv(EnvMaxAge, "")
+		cfg, err := TrustConfigFromEnv()
+		require.NoError(t, err)
+		assert.Nil(t, cfg.Trust)
+		assert.Equal(t, DefaultMaxAge, cfg.MaxAge)
+	})
+	t.Run("root document sets signers and maximum age", func(t *testing.T) {
+		t.Setenv(EnvRootFile, rootPath)
+		t.Setenv(EnvMaxAge, "")
+		cfg, err := TrustConfigFromEnv()
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Trust)
+		assert.Equal(t, 24*time.Hour, cfg.MaxAge)
+		assert.Equal(t, uint64(1), cfg.Root.Doc().Version)
+	})
+	t.Run("a client maximum age only shortens the root document's", func(t *testing.T) {
+		t.Setenv(EnvRootFile, rootPath)
+		t.Setenv(EnvMaxAge, "2h")
+		cfg, err := TrustConfigFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, 2*time.Hour, cfg.MaxAge)
+		t.Setenv(EnvMaxAge, "200h")
+		cfg, err = TrustConfigFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, 24*time.Hour, cfg.MaxAge)
+	})
+	t.Run("an unreadable root document is an error", func(t *testing.T) {
+		t.Setenv(EnvRootFile, filepath.Join(t.TempDir(), "missing.json"))
+		_, err := TrustConfigFromEnv()
+		assert.Error(t, err)
+	})
+	t.Run("an invalid maximum age is flagged", func(t *testing.T) {
+		t.Setenv(EnvRootFile, "")
+		t.Setenv(EnvMaxAge, "5m")
+		cfg, err := TrustConfigFromEnv()
+		require.NoError(t, err)
+		assert.True(t, cfg.MaxAgeInvalid)
 	})
 }
