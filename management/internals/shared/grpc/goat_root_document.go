@@ -6,8 +6,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/netbirdio/netbird/shared/management/goatmember"
 	"github.com/netbirdio/netbird/shared/management/goatrevoke"
 	"github.com/netbirdio/netbird/shared/management/goatroot"
+	"github.com/netbirdio/netbird/shared/management/mapsign"
+	"github.com/netbirdio/netbird/shared/management/proto"
 )
 
 // rootDocumentFile holds the goatnet root document read from a file and reads
@@ -71,4 +74,46 @@ func (r *revocationsFile) get() ([]*goatrevoke.Signed, error) {
 	}
 	r.list, r.modTime, r.size, r.loaded = list, fi.ModTime(), fi.Size(), true
 	return list, nil
+}
+
+// membershipIssuer issues each peer a membership certificate on every sync
+// response and remembers the latest one, so the certificates of a peer's
+// remote peers can be sent with its map.
+type membershipIssuer struct {
+	signer *mapsign.Signer
+	window time.Duration
+
+	mu     sync.Mutex
+	latest map[string]*goatmember.Signed
+}
+
+func newMembershipIssuer(signer *mapsign.Signer, window time.Duration) *membershipIssuer {
+	return &membershipIssuer{signer: signer, window: window, latest: map[string]*goatmember.Signed{}}
+}
+
+// attach issues peerKey a certificate now and puts it, with the latest
+// certificates of the remote peers in nm, into out.
+func (m *membershipIssuer) attach(peerKey string, nm *proto.NetworkMap, out *proto.SyncResponse) error {
+	if m.signer == nil {
+		return nil
+	}
+	own, err := goatmember.SignBy(&goatmember.Certificate{
+		GoatnetID:        m.signer.GoatnetID(),
+		PeerKey:          peerKey,
+		IssuedAtUnixNano: time.Now().UnixNano(),
+		WindowSeconds:    int64(m.window / time.Second),
+	}, m.signer)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.latest[peerKey] = own
+	remote := make([]*goatmember.Signed, 0, len(nm.GetRemotePeers()))
+	for _, p := range nm.GetRemotePeers() {
+		if c, ok := m.latest[p.GetWgPubKey()]; ok {
+			remote = append(remote, c)
+		}
+	}
+	m.mu.Unlock()
+	return goatmember.Attach(out, own, remote)
 }

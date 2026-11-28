@@ -39,3 +39,13 @@ func (e *Engine) acceptRevocations(*mgmProto.SyncResponse) {}
 func (e *Engine) revokedNow(string) bool { return false }
 
 func newRevocationStore(string) *goatrevoke.Store { return nil }
+
+type memberState struct{}
+
+func (e *Engine) startMembership() {}
+
+func (e *Engine) acceptCertificates(*mgmProto.SyncResponse) {}
+
+func (e *Engine) noteMap(*mgmProto.NetworkMap) {}
+
+func (e *Engine) refusedByCertificate(string) bool { return false }

@@ -307,6 +307,9 @@ type Engine struct {
 	revPort  int
 	// revokedListings counts network maps that listed a revoked peer. Protected by syncMsgMux.
 	revokedListings uint64
+
+	// member is the membership certificate state. Protected by syncMsgMux.
+	member memberState
 }
 
 // Peer is an instance of the Connection Peer
@@ -645,6 +648,7 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	if err := e.startRevocations(); err != nil {
 		log.Warnf("revocations from peers are not received: %v", err)
 	}
+	e.startMembership()
 	if e.cachedStart != nil {
 		if err := e.applyCachedMap(e.cachedStart); err != nil {
 			e.close()
@@ -967,6 +971,7 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		e.handleAutoUpdateVersion(nm.PeerConfig.AutoUpdate)
 	}
 	e.acceptRevocations(update)
+	e.acceptCertificates(update)
 
 	if update.GetNetbirdConfig() != nil {
 		wCfg := update.GetNetbirdConfig()
@@ -1042,6 +1047,8 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 		e.runningFromCache = false
 		e.cachedLazyExclude = nil
 	}
+
+	e.noteMap(nm)
 
 	// only apply new changes and ignore old ones
 	if err := e.updateNetworkMap(nm); err != nil {
@@ -1165,6 +1172,7 @@ func (e *Engine) applyCachedMap(entry *mapcache.Entry) error {
 		e.cachedLazyExclude[k] = true
 	}
 
+	e.noteMap(nm)
 	if err := e.updateNetworkMap(nm); err != nil {
 		return err
 	}
@@ -1589,7 +1597,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 	localPubKey := e.config.WgPrivateKey.PublicKey().String()
 	remotePeers := make([]*mgmProto.RemotePeerConfig, 0, len(networkMap.GetRemotePeers()))
 	for _, p := range networkMap.GetRemotePeers() {
-		if p.GetWgPubKey() != localPubKey && !e.revokedNow(p.GetWgPubKey()) {
+		if p.GetWgPubKey() != localPubKey && !e.revokedNow(p.GetWgPubKey()) && !e.refusedByCertificate(p.GetWgPubKey()) {
 			remotePeers = append(remotePeers, p)
 		}
 	}

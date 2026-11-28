@@ -82,6 +82,11 @@ type GoatMapSigning struct {
 	// RevocationsFile, when set, is a JSON list of signed revocations (goatrevoke)
 	// sent with every sync response. It is read again when the file changes.
 	RevocationsFile string
+	// MembershipWindow, when set, makes management issue each peer a membership
+	// certificate with every sync response, with this window; peers refuse
+	// each other when their certificates were issued further apart. Zero turns
+	// membership certificates off.
+	MembershipWindow util.Duration
 }
 
 // GetAuthAudiences returns the audience from the http config and device authorization flow config
