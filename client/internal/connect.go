@@ -265,7 +265,14 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		}
 
 		log.Debugf("connecting to the Management service %s", c.config.ManagementURL.Host)
-		mgmClient, err := mgm.NewClient(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
+		var mgmClient *mgm.GrpcClient
+		if usableCachedMap(cachePath, cacheBinding, trustCfg) != nil {
+			// A usable cached map: one short dial, so an unreachable management
+			// delays the start by CachedStartDialTimeout instead of minutes of retries.
+			mgmClient, err = mgm.NewClientWithDialTimeout(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled, CachedStartDialTimeout)
+		} else {
+			mgmClient, err = mgm.NewClient(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
+		}
 		if err != nil {
 			cached = usableCachedMap(cachePath, cacheBinding, trustCfg)
 			if cached == nil {
@@ -777,3 +784,7 @@ func closeConnWithLog(conn *net.UDPConn) {
 		log.Warnf("closing the testing port %d took %s. Usually it is safe to ignore, but continuous warnings may indicate a problem.", conn.LocalAddr().(*net.UDPAddr).Port, time.Since(startClosing))
 	}
 }
+
+// CachedStartDialTimeout bounds the one management dial of a client that can
+// start from its cached network map.
+const CachedStartDialTimeout = 3 * time.Second
