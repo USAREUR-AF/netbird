@@ -26,6 +26,7 @@ import (
 	"github.com/netbirdio/netbird/client/iface/netstack"
 	"github.com/netbirdio/netbird/client/internal/dns"
 	"github.com/netbirdio/netbird/client/internal/listener"
+	"github.com/netbirdio/netbird/client/internal/mapcache"
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
@@ -253,10 +254,22 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			cancel()
 		}()
 
+		cachePath := mapcache.PathForState(path)
+		cacheBinding := mapcache.Binding{ManagementURL: c.config.ManagementURL.String(), PeerKey: myPrivateKey.PublicKey().String()}
+		var cached *mapcache.Entry
+
 		log.Debugf("connecting to the Management service %s", c.config.ManagementURL.Host)
 		mgmClient, err := mgm.NewClient(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
 		if err != nil {
-			return wrapErr(gstatus.Errorf(codes.FailedPrecondition, "failed connecting to Management Service : %s", err))
+			cached = usableCachedMap(cachePath, cacheBinding)
+			if cached == nil {
+				return wrapErr(gstatus.Errorf(codes.FailedPrecondition, "failed connecting to Management Service : %s", err))
+			}
+			log.Warnf("management is unreachable (%v); starting from the cached network map and retrying management in the background", err)
+			mgmClient, err = mgm.NewClientLazy(engineCtx, c.config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
+			if err != nil {
+				return wrapErr(gstatus.Errorf(codes.FailedPrecondition, "failed connecting to Management Service : %s", err))
+			}
 		}
 		mgmNotifier := statusRecorderToMgmConnStateNotifier(c.statusRecorder)
 		mgmClient.SetConnStateListener(mgmNotifier)
@@ -279,20 +292,39 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		}()
 
 		// connect (just a connection, no stream yet) and login to Management Service to get an initial global Netbird config
-		loginStarted := time.Now()
-		loginResp, err := loginToManagement(engineCtx, mgmClient, publicSSHKey, c.config)
-		if err != nil {
-			c.clientMetrics.RecordLoginDuration(engineCtx, time.Since(loginStarted), false)
-			log.Debug(err)
-			if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.PermissionDenied) {
-				state.Set(StatusNeedsLogin)
-				_ = c.Stop()
-				return backoff.Permanent(wrapErr(err)) // unrecoverable error
+		var loginResp *mgmProto.LoginResponse
+		if cached == nil {
+			loginStarted := time.Now()
+			loginResp, err = loginToManagement(engineCtx, mgmClient, publicSSHKey, c.config)
+			if err != nil {
+				c.clientMetrics.RecordLoginDuration(engineCtx, time.Since(loginStarted), false)
+				log.Debug(err)
+				if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.PermissionDenied) {
+					// Management refused this peer: its last network map must not be used again.
+					if rmErr := mapcache.Remove(cachePath); rmErr != nil {
+						log.Warnf("failed to remove the cached network map: %v", rmErr)
+					}
+					state.Set(StatusNeedsLogin)
+					_ = c.Stop()
+					return backoff.Permanent(wrapErr(err)) // unrecoverable error
+				}
+				cached = usableCachedMap(cachePath, cacheBinding)
+				if cached == nil {
+					return wrapErr(err)
+				}
+				log.Warnf("login to management failed (%v); starting from the cached network map and retrying management in the background", err)
+			} else {
+				c.clientMetrics.RecordLoginDuration(engineCtx, time.Since(loginStarted), true)
+				c.statusRecorder.MarkManagementConnected()
 			}
-			return wrapErr(err)
 		}
-		c.clientMetrics.RecordLoginDuration(engineCtx, time.Since(loginStarted), true)
-		c.statusRecorder.MarkManagementConnected()
+		if cached != nil {
+			loginResp, err = cached.LoginResponse()
+			if err != nil {
+				_ = mapcache.Remove(cachePath)
+				return wrapErr(err)
+			}
+		}
 
 		localPeerState := peer.LocalPeerState{
 			IP:              loginResp.GetPeerConfig().GetAddress(),
@@ -315,8 +347,9 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			c.statusRecorder.MarkSignalDisconnected(err)
 		}()
 
-		// with the global Netbird config in hand connect (just a connection, no stream yet) Signal
-		signalClient, err := connectToSignal(engineCtx, loginResp.GetNetbirdConfig(), myPrivateKey)
+		// with the global Netbird config in hand connect (just a connection, no stream yet) Signal.
+		// From a cached map signal is usually unreachable too: connect in the background.
+		signalClient, err := connectToSignal(engineCtx, loginResp.GetNetbirdConfig(), myPrivateKey, cached != nil)
 		if err != nil {
 			log.Error(err)
 			return wrapErr(err)
@@ -331,9 +364,15 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		signalNotifier := statusRecorderToSignalConnStateNotifier(c.statusRecorder)
 		signalClient.SetConnStateListener(signalNotifier)
 
-		c.statusRecorder.MarkSignalConnected()
+		if cached == nil {
+			c.statusRecorder.MarkSignalConnected()
+		}
 
 		relayURLs, token := parseRelayInfo(loginResp)
+		if cached != nil {
+			// The cache holds no relay token; relay starts with the first map from management.
+			relayURLs, token = nil, nil
+		}
 		if override, ok := peer.OverrideRelayURLs(); ok {
 			log.Infof("overriding relay URLs from %s: %v", peer.EnvKeyNBHomeRelayServers, override)
 			relayURLs = override
@@ -364,6 +403,16 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 
 		checks := loginResp.GetChecks()
 
+		var mapStore *mapcache.Store
+		if !mapcache.Disabled() && cachePath != "" {
+			mapStore = mapcache.NewStore(cachePath, cacheBinding, nil)
+			if cached != nil {
+				mapStore.Seed(cached)
+			} else {
+				mapStore.SetLogin(loginResp)
+			}
+		}
+
 		c.engineMutex.Lock()
 		engine := NewEngine(engineCtx, cancel, engineConfig, EngineServices{
 			SignalClient:   signalClient,
@@ -374,8 +423,12 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			StateManager:   stateManager,
 			UpdateManager:  c.updateManager,
 			ClientMetrics:  c.clientMetrics,
+			MapCache:       mapStore,
 		}, mobileDependency)
 		engine.SetSyncResponsePersistence(c.persistSyncResponse)
+		if cached != nil {
+			engine.SetCachedStart(cached)
+		}
 		c.engine = engine
 		c.engineMutex.Unlock()
 
@@ -620,21 +673,62 @@ func selectMTU(localMTU uint16, peerMTU int32) uint16 {
 }
 
 // connectToSignal creates Signal Service client and established a connection
-func connectToSignal(ctx context.Context, wtConfig *mgmProto.NetbirdConfig, ourPrivateKey wgtypes.Key) (*signal.GrpcClient, error) {
+func connectToSignal(ctx context.Context, wtConfig *mgmProto.NetbirdConfig, ourPrivateKey wgtypes.Key, lazy bool) (*signal.GrpcClient, error) {
 	var sigTLSEnabled bool
-	if wtConfig.Signal.Protocol == mgmProto.HostConfig_HTTPS {
+	if wtConfig.GetSignal().GetProtocol() == mgmProto.HostConfig_HTTPS {
 		sigTLSEnabled = true
 	} else {
 		sigTLSEnabled = false
 	}
 
-	signalClient, err := signal.NewClient(ctx, wtConfig.Signal.Uri, ourPrivateKey, sigTLSEnabled)
+	newClient := signal.NewClient
+	if lazy {
+		newClient = signal.NewClientLazy
+	}
+	signalClient, err := newClient(ctx, wtConfig.GetSignal().GetUri(), ourPrivateKey, sigTLSEnabled)
 	if err != nil {
 		log.Errorf("error while connecting to the Signal Exchange Service %s: %s", wtConfig.Signal.Uri, err)
 		return nil, gstatus.Errorf(codes.FailedPrecondition, "failed connecting to Signal Service : %s", err)
 	}
 
 	return signalClient, nil
+}
+
+// usableCachedMap returns the cached network map at path when it may be used for b,
+// or nil with the reason logged.
+func usableCachedMap(path string, b mapcache.Binding) *mapcache.Entry {
+	if path == "" || mapcache.Disabled() {
+		return nil
+	}
+	maxAge, err := mapcache.MaxAgeFromEnv()
+	if err != nil {
+		log.Errorf("not using the cached network map: %v", err)
+		return nil
+	}
+	entry, err := mapcache.LoadUsable(path, b, maxAge, mapcache.SystemClock)
+	if err != nil {
+		if !errors.Is(err, mapcache.ErrNotFound) {
+			log.Warnf("not using the cached network map %s: %v", path, err)
+		}
+		return nil
+	}
+	return entry
+}
+
+// HasUsableCachedMap reports whether a client with config could start from its
+// cached network map now. statePath is the client's state file.
+func HasUsableCachedMap(config *profilemanager.Config, statePath string) bool {
+	if config == nil || config.ManagementURL == nil {
+		return false
+	}
+	key, err := wgtypes.ParseKey(config.PrivateKey)
+	if err != nil {
+		return false
+	}
+	return usableCachedMap(mapcache.PathForState(statePath), mapcache.Binding{
+		ManagementURL: config.ManagementURL.String(),
+		PeerKey:       key.PublicKey().String(),
+	}) != nil
 }
 
 // loginToManagement creates Management ServiceDependencies client, establishes a connection, logs-in and gets a global Netbird config (signal, turn, stun hosts, etc)

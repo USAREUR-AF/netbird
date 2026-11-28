@@ -56,11 +56,26 @@ type GrpcClient struct {
 
 // NewClient creates a new Signal client
 func NewClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
+	return newClient(ctx, addr, key, tlsEnabled, false)
+}
+
+// NewClientLazy creates a Signal client without waiting for the server to answer.
+// The connection is made in the background; Receive waits for it.
+// Used when the client starts from a cached network map while signal is unreachable.
+func NewClientLazy(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
+	return newClient(ctx, addr, key, tlsEnabled, true)
+}
+
+func newClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled bool, lazy bool) (*GrpcClient, error) {
 	var conn *grpc.ClientConn
 
 	operation := func() error {
 		var err error
-		conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.SignalComponent)
+		if lazy {
+			conn, err = nbgrpc.CreateConnectionLazy(ctx, addr, tlsEnabled, wsproxy.SignalComponent)
+		} else {
+			conn, err = nbgrpc.CreateConnection(ctx, addr, tlsEnabled, wsproxy.SignalComponent)
+		}
 		if err != nil {
 			return fmt.Errorf("create connection: %w", err)
 		}

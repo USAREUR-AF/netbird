@@ -29,6 +29,35 @@ func Backoff(ctx context.Context) backoff.BackOff {
 // CreateConnection creates a gRPC client connection with the appropriate transport options.
 // The component parameter specifies the WebSocket proxy component path (e.g., "/management", "/signal").
 func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, component string, extraOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	opts := append(dialOptions(tlsEnabled, component), grpc.WithBlock())
+	opts = append(opts, extraOpts...)
+
+	conn, err := grpc.DialContext(connCtx, addr, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("dial context: %w", err)
+	}
+
+	return conn, nil
+}
+
+// CreateConnectionLazy creates a gRPC client connection without waiting for the server.
+// The connection is made in the background and re-made after failures, so the caller can
+// start while the server is unreachable. Used when the client starts from a cached network map.
+func CreateConnectionLazy(ctx context.Context, addr string, tlsEnabled bool, component string, extraOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	opts := append(dialOptions(tlsEnabled, component), extraOpts...)
+
+	conn, err := grpc.DialContext(ctx, addr, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("dial context: %w", err)
+	}
+
+	return conn, nil
+}
+
+func dialOptions(tlsEnabled bool, component string) []grpc.DialOption {
 	transportOption := grpc.WithTransportCredentials(insecure.NewCredentials())
 	// for js, the outer websocket layer takes care of tls
 	if tlsEnabled && runtime.GOOS != "js" {
@@ -43,24 +72,12 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
 		}))
 	}
 
-	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	opts := []grpc.DialOption{
+	return []grpc.DialOption{
 		transportOption,
 		WithCustomDialer(tlsEnabled, component),
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    30 * time.Second,
 			Timeout: 10 * time.Second,
 		}),
 	}
-	opts = append(opts, extraOpts...)
-
-	conn, err := grpc.DialContext(connCtx, addr, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("dial context: %w", err)
-	}
-
-	return conn, nil
 }

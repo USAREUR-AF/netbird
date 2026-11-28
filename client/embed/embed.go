@@ -230,14 +230,8 @@ func (c *Client) Start(startCtx context.Context) error {
 	// nolint:staticcheck
 	ctx = context.WithValue(ctx, system.DeviceNameCtxKey, c.deviceName)
 
-	authClient, err := auth.NewAuth(ctx, c.config.PrivateKey, c.config.ManagementURL, c.config)
-	if err != nil {
-		return fmt.Errorf("create auth client: %w", err)
-	}
-	defer authClient.Close()
-
-	if err, _ := authClient.Login(ctx, c.setupKey, c.jwtToken); err != nil {
-		return fmt.Errorf("login: %w", err)
+	if err := c.login(ctx); err != nil {
+		return err
 	}
 	client := internal.NewConnectClient(ctx, c.config, c.recorder)
 	client.SetSyncResponsePersistence(true)
@@ -267,6 +261,35 @@ func (c *Client) Start(startCtx context.Context) error {
 	c.cancel = cancel
 
 	return nil
+}
+
+// login logs in to management. When management cannot be reached and the
+// client has a usable cached network map, it returns nil so the client starts
+// from that map; a refusal by management is always returned.
+func (c *Client) login(ctx context.Context) error {
+	authClient, err := auth.NewAuth(ctx, c.config.PrivateKey, c.config.ManagementURL, c.config)
+	if err != nil {
+		if c.canStartFromCachedMap() {
+			logrus.Warnf("management is unreachable (%v); starting from the cached network map", err)
+			return nil
+		}
+		return fmt.Errorf("create auth client: %w", err)
+	}
+	defer authClient.Close()
+
+	err, isAuthError := authClient.Login(ctx, c.setupKey, c.jwtToken)
+	if err == nil {
+		return nil
+	}
+	if !isAuthError && c.canStartFromCachedMap() {
+		logrus.Warnf("login to management failed (%v); starting from the cached network map", err)
+		return nil
+	}
+	return fmt.Errorf("login: %w", err)
+}
+
+func (c *Client) canStartFromCachedMap() bool {
+	return internal.HasUsableCachedMap(c.config, profilemanager.NewServiceManager("").GetStatePath())
 }
 
 // Stop gracefully stops the client.
